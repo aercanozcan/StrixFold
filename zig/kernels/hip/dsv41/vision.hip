@@ -1,27 +1,10 @@
 #pragma clang fp contract(off)
-/* The DeepSeek-V4.1 vision tower and aligner on gfx1151 (registered in registry.json as group "vision"; vit_hip.zig
- * launches them, hip_load.zig binds them; only a rank serving MODALITIES=text_image needs them).
- *
- * Adapted from engineLab's HIP tower (src/hip_ds41_vision.hip, include/strix/ds41_vision_math.hpp and the
- * declared_exp / declared_sqrt of include/strix/ds41_moe.hpp, branch pr/ds41-vision at 481141258, Apache-2.0, by the
- * same owner), arithmetic unchanged, so every step's bytes equal engineLab's host reference (encode_reference) and its
- * device tower: BF16 weights and activations, every FP32 operation a single IEEE operation in a declared order, no
- * contraction (the pragma above and the kit's -ffp-contract=off), no fast math, no library transcendental:
- *  - linear: y(m, o) = bf16(acc + bf16 bias) with acc the FP32 fma chain over k ascending from +0 (tiles of 16 k in
- *    order; tails padded with zeros, which leave the accumulator unchanged: it starts at +0 and never becomes -0);
- *  - RMSNorm: one wave per row; lane l sums fma(x, x) over k = l, l + 32, ...; the lanes combine by the butterfly
- *    v + v[l ^ d], d = 16 .. 1; out = bf16(w * (x * (1 / sqrt(ss / D + eps)))) with a correctly rounded sqrt;
- *  - attention: per (64 query rows, head) an online softmax over key tiles of 64 (declared_exp, 16-lane reductions),
- *    scores = (fma chain over d) * 0.125, output bf16(o / l);
- *  - rotary (rotate-half, tables built on the host in double precision), residual add, silu * up, erf-GELU (the
- *    fdlibm/musl erff approximations with declared_exp), the 3 x 3 unfold and the span: their host forms are the same
- *    expressions.
- * declared_erf follows fdlibm/musl erff (fdlibm: Copyright (C) 1993 by Sun Microsystems, Inc.; permission to use,
- * copy, modify and distribute this software is freely granted, provided that this notice is preserved). */
+// The DeepSeek-V4.1 vision tower and aligner on gfx1151 (vit_hip.zig launches them); third-party helpers marked below.
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 #include "abi.h"
 
+// Every FP32 operation is one IEEE operation in a declared order: no contraction (the pragma above), no fast math.
 #define TF_DS_VISION_THREADS 256
 
 static __device__ __forceinline__ uint16_t tf_ds_v_bf16_round(float v) {
@@ -34,8 +17,7 @@ static __device__ __forceinline__ float tf_ds_v_bf16_float(uint16_t b) { return 
 
 static __device__ __forceinline__ float tf_ds_v_pow2(int k) { return __uint_as_float((uint32_t)(k + 127) << 23u); }
 
-// exp(x) from basic IEEE operations: Cody-Waite reduction by ln 2, degree-7 Taylor polynomial (Horner), two-step
-// power-of-two scaling; below -103 0, above 88 +inf.
+// declared_exp of strix-halo-engine-lab (hyukudan, Apache-2.0; THIRD_PARTY_NOTICES.md): Cody-Waite, degree-7 Taylor.
 static __device__ __forceinline__ float tf_ds_v_exp(float x) {
     if (!(x == x)) return x;
     if (x > 88.0f) return __builtin_huge_valf();
@@ -54,9 +36,10 @@ static __device__ __forceinline__ float tf_ds_v_exp(float x) {
     return (p * tf_ds_v_pow2(k1)) * tf_ds_v_pow2(k2);
 }
 
-// Correctly rounded float square root: the float rounding of the correctly rounded double root.
+// declared_sqrt of strix-halo-engine-lab (hyukudan, Apache-2.0): the float rounding of the correctly rounded double root.
 static __device__ __forceinline__ float tf_ds_v_sqrt(float x) { return (float)__dsqrt_rn((double)x); }
 
+// erff of fdlibm as musl carries it (FreeBSD s_erff.c). Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved. Developed at SunPro, a Sun Microsystems, Inc. business. Permission to use, copy, modify, and distribute this software is freely granted, provided that this notice is preserved.
 static __device__ __forceinline__ float tf_ds_v_erf(float x) {
     const uint32_t bits = __float_as_uint(x);
     const bool negative = (bits >> 31u) != 0u;
@@ -105,7 +88,7 @@ static __device__ __forceinline__ uint16_t tf_ds_v_silu_mul(uint16_t gate, uint1
     return tf_ds_v_bf16_round(tf_ds_v_bf16_float(tf_ds_v_bf16_round(g / (1.0f + tf_ds_v_exp(-g)))) * tf_ds_v_bf16_float(up));
 }
 
-/* ---- linear: y [M, O] bf16 = bf16(x [M, K] bf16 . w [O, K]^T (+ bias [O] bf16)), all rows contiguous ---- */
+// linear: y [M, O] = bf16(acc + bf16 bias), acc the FP32 fma chain over k ascending from +0 (16-k tiles, zero tails)
 #define TF_DS_VISION_BM 128
 #define TF_DS_VISION_BO 128
 #define TF_DS_VISION_BK 16
@@ -154,7 +137,7 @@ static __device__ __forceinline__ float tf_ds_v_wave_sum(float v) {
     return v;
 }
 
-/* ---- RMSNorm: out [rows, D] = bf16(w * (x * r)), one wave per row (8 rows a block) ---- */
+// RMSNorm: out = bf16(w * (x * (1 / sqrt(ss / D + eps)))), one wave a row, its lanes summed by the xor butterfly
 extern "C" __global__ void __launch_bounds__(TF_DS_VISION_THREADS)
 tf_ds_vision_rms_norm(const uint16_t* x, const uint16_t* w, uint16_t* out, int32_t rows, int32_t D, float eps) {
     const int row = (int)(blockIdx.x * (TF_DS_VISION_THREADS / 32u) + threadIdx.x / 32u), lane = (int)(threadIdx.x % 32u);
@@ -170,9 +153,7 @@ tf_ds_vision_rms_norm(const uint16_t* x, const uint16_t* w, uint16_t* out, int32
         out[(int64_t)row * D + k] = tf_ds_v_bf16_round(tf_ds_v_bf16_float(w[k]) * (tf_ds_v_bf16_float(xr[k]) * r));
 }
 
-/* ---- attention: attn [N, D] bf16 of qkv [N, 3D] bf16 (q | k | v, 16 heads of 64), one block per (64 rows, head) ----
- * Thread t = 16 tr + tc owns rows 4 tr .. 4 tr + 3 with keys 4 tc .. 4 tc + 3 (scores) and dims 4 tc .. 4 tc + 3
- * (output); a row's running max, rescale and sum live identically on the 16 lanes of a half wave (xor 8, 4, 2, 1). */
+// attention of qkv [N, 3D] (16 heads of 64): a block per (64 rows, head), thread 16 tr + tc on rows 4 tr .. 4 tr + 3
 #define TF_DS_VISION_QT 64
 #define TF_DS_VISION_KB 64
 #define TF_DS_VISION_HD 64
@@ -205,6 +186,7 @@ tf_ds_vision_attention(const uint16_t* qkv, uint16_t* attn, int32_t N, int32_t D
         if (q0 + r < N) tf_ds_v_unpack(*reinterpret_cast<const uint2*>(qkv + (q0 + r) * row3 + hh * kHD + dq), f);
         for (int i = 0; i < 4; ++i) Qs[dq + i][r] = f[i];
     }
+    // keys 4 tc .. 4 tc + 3 for the scores, dims 4 tc .. 4 tc + 3 for the output; a row's max and sum on its 16 lanes
     float o[4][4], m[4], lsum[4];
     for (int a = 0; a < 4; ++a) {
         m[a] = -__builtin_huge_valf();
@@ -293,7 +275,7 @@ tf_ds_vision_attention(const uint16_t* qkv, uint16_t* attn, int32_t N, int32_t D
     }
 }
 
-/* ---- rotary on q and k in place (rotate-half within each head): one thread per (row, q|k, head, pair) ---- */
+// rotary on q and k in place (rotate-half within each head): one thread per (row, q|k, head, pair)
 extern "C" __global__ void __launch_bounds__(TF_DS_VISION_THREADS)
 tf_ds_vision_rope(uint16_t* qkv, const float* cosv, const float* sinv, int32_t N, int32_t D, int32_t heads, int32_t hd) {
     const int half = hd / 2;
@@ -310,13 +292,13 @@ tf_ds_vision_rope(uint16_t* qkv, const float* cosv, const float* sinv, int32_t N
     v[j + half] = tf_ds_v_bf16_round(d + e);
 }
 
-/* ---- x = bf16(x + y) ---- */
+// x = bf16(x + y)
 extern "C" __global__ void __launch_bounds__(TF_DS_VISION_THREADS) tf_ds_vision_add(uint16_t* x, const uint16_t* y, int64_t n) {
     const int64_t i = (int64_t)blockIdx.x * TF_DS_VISION_THREADS + threadIdx.x;
     if (i < n) x[i] = tf_ds_v_bf16_round(tf_ds_v_bf16_float(x[i]) + tf_ds_v_bf16_float(y[i]));
 }
 
-/* ---- mid [N, I] = silu(gate) * up of gu [N, 2I] (gate first) ---- */
+// mid [N, I] = silu(gate) * up of gu [N, 2I] (gate first)
 extern "C" __global__ void __launch_bounds__(TF_DS_VISION_THREADS) tf_ds_vision_silu_mul(const uint16_t* gu, uint16_t* mid, int32_t N, int32_t I) {
     const int64_t i = (int64_t)blockIdx.x * TF_DS_VISION_THREADS + threadIdx.x;
     if (i >= (int64_t)N * I) return;
@@ -324,14 +306,13 @@ extern "C" __global__ void __launch_bounds__(TF_DS_VISION_THREADS) tf_ds_vision_
     mid[i] = tf_ds_v_silu_mul(gu[n * 2 * I + k], gu[n * 2 * I + I + k]);
 }
 
-/* ---- v = bf16(gelu(v)) ---- */
+// v = bf16(gelu(v))
 extern "C" __global__ void __launch_bounds__(TF_DS_VISION_THREADS) tf_ds_vision_gelu(uint16_t* v, int64_t n) {
     const int64_t i = (int64_t)blockIdx.x * TF_DS_VISION_THREADS + threadIdx.x;
     if (i < n) v[i] = tf_ds_v_bf16_round(tf_ds_v_gelu(tf_ds_v_bf16_float(v[i])));
 }
 
-/* ---- M x M unfold: feature ch * M * M + ki * M + kj of cell (lh, lw) = patch (M lh + ki, M lw + kj), 0 past the grid;
- * unf [llm_h * llm_w, D * M * M] row-major ---- */
+// M x M unfold: feature ch M M + ki M + kj of cell (lh, lw) is patch (M lh + ki, M lw + kj), 0 past the grid
 extern "C" __global__ void __launch_bounds__(TF_DS_VISION_THREADS)
 tf_ds_vision_unfold(const uint16_t* h, uint16_t* unf, int32_t vit_w, int32_t vit_h, int32_t llm_w, int32_t llm_h, int32_t D, int32_t M) {
     const int64_t F = (int64_t)D * M * M;
@@ -344,7 +325,7 @@ tf_ds_vision_unfold(const uint16_t* h, uint16_t* unf, int32_t vit_w, int32_t vit
     unf[i] = (py < vit_h && px < vit_w) ? h[((int64_t)py * vit_w + px) * D + ch] : (uint16_t)0;
 }
 
-/* ---- the span [llm_h * (llm_w + 1) + 2, D]: START, (each row of cells, NEWLINE), END ---- */
+// the span [llm_h * (llm_w + 1) + 2, D]: START, (each row of cells, NEWLINE), END
 extern "C" __global__ void __launch_bounds__(TF_DS_VISION_THREADS)
 tf_ds_vision_span(const uint16_t* rows, const uint16_t* start, const uint16_t* newline, const uint16_t* end, uint16_t* out, int32_t llm_w,
                   int32_t llm_h, int32_t D) {

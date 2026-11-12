@@ -240,7 +240,7 @@
   },
   {
    "source": "vision.hip",
-   "owner": "vision (engineLab's HIP tower, adapted)",
+   "owner": "vision",
    "kit": "dsv41",
    "kernels": [
     {"id": "vision.linear", "symbol": "tf_ds_vision_linear", "block": [256, 1, 1], "numerics": "vision_declared"},

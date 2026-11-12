@@ -112,6 +112,21 @@ PyTorch's `gemm_and_bias` does. The image routing bias (`gate_bias_vl.safetensor
 The MTP layer TensorFold drafts with comes from that checkpoint's last shard (MIT), converted by
 `families/deepseek_v4/convert.py`.
 
+`zig/kernels/hip/dsv41/vision.hip` (the DeepSeek-V4.1 vision tower on HIP) holds two helpers from
+[hyukudan/strix-halo-engine-lab](https://github.com/hyukudan/strix-halo-engine-lab): `tf_ds_v_exp` and `tf_ds_v_sqrt`
+are its `declared_exp` and `declared_sqrt` (`include/strix/ds41_moe.hpp`), renamed, Apache License 2.0
+(`LICENSES/Apache-2.0.txt`). Its `tf_ds_v_erf` follows fdlibm's `erff` as musl carries it (FreeBSD `s_erff.c`, converted
+to float by Ian Lance Taylor, Cygnus Support), under this notice, kept in that file too:
+
+> Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+>
+> Developed at SunPro, a Sun Microsystems, Inc. business.
+> Permission to use, copy, modify, and distribute this
+> software is freely granted, provided that this notice
+> is preserved.
+
+The file's kernels themselves were written by Daniel Turini for this port.
+
 TensorFold ships no model weights. The `z-lab/Qwen3.8-27B-DFlash2` model card states Apache-2.0.
 The optional `incoai/GLM-5.3-Flash-DFlash2` model card states CC BY-NC-ND 4.0, for non-commercial use
 without derivatives. Each checkpoint keeps its own license.

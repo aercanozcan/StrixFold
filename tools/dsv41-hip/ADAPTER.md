@@ -380,8 +380,9 @@ tower on rank 0. Everything above about `text` still holds: a text rank opens, l
   unfold, span), bound by `hip_load.vision` as an optional group. Only rank 0 of a text_image pair reads, loads or
   requires the kit's vision object (`Kit.open`'s `vision` feature); a text rank and rank 1 skip it. vision.zig picks the backend's tower at compile time;
   picture.zig, pil.zig, the payload and the server hook are shared with CUDA.
-- **Numerical identity:** engineLab's declared arithmetic (its HIP tower, `pr/ds41-vision` 481141258, adapted, arithmetic
-  unchanged), not torch's kernels: every linear one FP32 fma chain over k ascending per output (bf16 after the bias),
+- **Numerical identity:** engineLab's declared arithmetic (the HIP tower written by this port's author on
+  strix-halo-engine-lab's `pr/ds41-vision` 481141258, adapted, arithmetic unchanged; its exp and sqrt are hyukudan's
+  `declared_exp` / `declared_sqrt`, its erf fdlibm's `erff`: THIRD_PARTY_NOTICES.md), not torch's kernels: every linear one FP32 fma chain over k ascending per output (bf16 after the bias),
   RMSNorm a wave-order sum with a correctly rounded root, attention a fused online softmax over 64-key tiles with a
   declared exp, the 2D RoPE tables built on the host in double precision (libc pow / cos / sin), erf-GELU the fdlibm
   approximations. Gate: `tf-dsv41-vision-check` (dsv41-hip-gpu-test) against engineLab's `encode_reference` dumps
