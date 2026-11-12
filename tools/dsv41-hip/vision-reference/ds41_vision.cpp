@@ -45,7 +45,10 @@ struct Parser {
             if (t[i] == '\\') {
                 if (++i >= t.size()) break;
                 const char e = t[i];
-                if (e == 'u') fail("header: \\u escapes are not expected in tensor names");
+                if (e == 'u') {
+                    utf8(out, codepoint());
+                    continue;
+                }
                 out += e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e == 'b' ? '\b' : e == 'f' ? '\f' : e;
             } else {
                 out += t[i];
@@ -54,6 +57,51 @@ struct Parser {
         }
         expect('"');
         return out;
+    }
+    // the four hex digits after "\\u" (i at the 'u'); leaves i on the last digit
+    std::uint32_t hex4() {
+        if (i + 4 >= t.size()) fail("header: short \\u escape");
+        std::uint32_t v = 0;
+        for (int k = 0; k < 4; ++k) {
+            const char h = t[++i];
+            const int d = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+            if (d < 0) fail("header: bad \\u escape");
+            v = v * 16U + static_cast<std::uint32_t>(d);
+        }
+        return v;
+    }
+    // a \\u escape's code point, a surrogate pair joined; i ends past the escape
+    std::uint32_t codepoint() {
+        std::uint32_t cp = hex4();
+        ++i;
+        if (cp >= 0xD800U && cp <= 0xDBFFU) {
+            if (i + 1 >= t.size() || t[i] != '\\' || t[i + 1] != 'u') fail("header: unpaired surrogate");
+            ++i;
+            const std::uint32_t lo = hex4();
+            ++i;
+            if (lo < 0xDC00U || lo > 0xDFFFU) fail("header: unpaired surrogate");
+            cp = 0x10000U + ((cp - 0xD800U) << 10U) + (lo - 0xDC00U);
+        } else if (cp >= 0xDC00U && cp <= 0xDFFFU) {
+            fail("header: unpaired surrogate");
+        }
+        return cp;
+    }
+    static void utf8(std::string& out, std::uint32_t cp) {
+        if (cp < 0x80U) {
+            out += static_cast<char>(cp);
+        } else if (cp < 0x800U) {
+            out += static_cast<char>(0xC0U | (cp >> 6U));
+            out += static_cast<char>(0x80U | (cp & 0x3FU));
+        } else if (cp < 0x10000U) {
+            out += static_cast<char>(0xE0U | (cp >> 12U));
+            out += static_cast<char>(0x80U | ((cp >> 6U) & 0x3FU));
+            out += static_cast<char>(0x80U | (cp & 0x3FU));
+        } else {
+            out += static_cast<char>(0xF0U | (cp >> 18U));
+            out += static_cast<char>(0x80U | ((cp >> 12U) & 0x3FU));
+            out += static_cast<char>(0x80U | ((cp >> 6U) & 0x3FU));
+            out += static_cast<char>(0x80U | (cp & 0x3FU));
+        }
     }
     Json value(int depth) {
         if (depth > 8) fail("header nests too deep");
@@ -88,7 +136,11 @@ struct Parser {
         }
         if (c >= '0' && c <= '9') {
             v.kind = Json::number;
-            while (i < t.size() && t[i] >= '0' && t[i] <= '9') v.n = v.n * 10U + static_cast<std::uint64_t>(t[i++] - '0');
+            while (i < t.size() && t[i] >= '0' && t[i] <= '9') {
+                const auto d = static_cast<std::uint64_t>(t[i++] - '0');
+                if (v.n > (UINT64_MAX - d) / 10U) fail("header: integer too large");
+                v.n = v.n * 10U + d;
+            }
             return v;
         }
         if (t.compare(i, 4, "null") == 0) return i += 4, v;
@@ -130,6 +182,7 @@ VisionWeights load_vision_sidecar(const std::filesystem::path& dir) {
     w.file_bytes = std::filesystem::file_size(path);
     std::uint8_t len_le[8];
     in.read(reinterpret_cast<char*>(len_le), 8);
+    if (!in) fail("bad header length");
     std::uint64_t hlen = 0;
     for (int b = 7; b >= 0; --b) hlen = (hlen << 8U) | len_le[b];
     if (!in || hlen > (64ULL << 20U) || 8U + hlen > w.file_bytes) fail("bad header length");
@@ -180,7 +233,7 @@ VisionWeights load_vision_sidecar(const std::filesystem::path& dir) {
         const std::size_t elements = static_cast<std::size_t>(wt.out ? wt.in * wt.out : wt.in);
         const auto span = offsets == t.end() ? std::vector<std::uint64_t>{} : integers(offsets->second, wt.name + " data_offsets");
         if (span.size() != 2U || span[1] < span[0] || span[1] - span[0] != elements * 2U) fail(wt.name + " byte size");
-        if (base + span[1] > w.file_bytes) fail(wt.name + " lies past the end of the file");
+        if (span[1] > w.file_bytes - base) fail(wt.name + " lies past the end of the file");
         w.tensors.push_back({wt.name, {total, elements}});
         total += elements;
         starts.push_back(base + span[0]);
