@@ -158,6 +158,13 @@ pub const Encoder = struct {
         }
     }
 
+    /// Whether the thread should leave job `j` before its next picture: forgotten, or the encoder stopping.
+    fn stopped(e: *Encoder, j: *const Job) bool {
+        e.lock();
+        defer e.unlock();
+        return j.gone or e.closing;
+    }
+
     fn free(e: *Encoder, j: *Job) void {
         e.freePayloads(j);
         e.gpa.free(j.payloads);
@@ -204,6 +211,7 @@ pub const Encoder = struct {
 
     fn encode(e: *Encoder, j: *Job) !void {
         for (j.payloads, j.tokens, j.ends) |p, *t, *end| {
+            if (p.len > 0 and e.stopped(j)) return error.EncodeCancelled;
             t.* = if (p.len > 0) try e.tower.rows(e.tower.ctx, p, e.gpa, &j.rows) else 0;
             end.* = j.rows.items.len;
         }
@@ -213,6 +221,7 @@ pub const Encoder = struct {
 /// A tower whose pictures are [n, v]: n rows of four bytes v; it holds each encode while `hold` is set.
 const Fake = struct {
     hold: std.atomic.Value(bool) = .init(false),
+    entered: std.atomic.Value(u32) = .init(0), // pictures whose encode has begun
     encodes: std.atomic.Value(u32) = .init(0),
     fail: bool = false,
 
@@ -224,6 +233,7 @@ const Fake = struct {
 
     fn rows(ctx: *anyopaque, payload: []const u8, gpa: Allocator, out: *std.ArrayList(u8)) anyerror!usize {
         const f: *Fake = @ptrCast(@alignCast(ctx));
+        _ = f.entered.fetchAdd(1, .acq_rel);
         while (f.hold.load(.acquire)) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
         _ = f.encodes.fetchAdd(1, .acq_rel);
         if (f.fail) return error.DeviceFault;
@@ -265,6 +275,7 @@ test "an encoder hands each request its pictures' rows in order, the rows that c
     try std.testing.expectEqual(@as(usize, 2), try e.take(&a, 0, gpa, &out));
     try std.testing.expectEqual(@as(usize, 20), out.items.len);
     try std.testing.expect(std.mem.allEqual(u8, out.items[0..12], 9) and std.mem.allEqual(u8, out.items[12..], 7));
+    while (woken.n.load(.acquire) == 0) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {}; // after ready
     try std.testing.expectEqual(@as(u32, 1), woken.n.load(.acquire));
     e.forget(&a);
     try std.testing.expect(e.ready(&a)); // no job: its prompt pass says why
@@ -336,4 +347,61 @@ test "a request over the image row cap fails at once, its pictures never encoded
     try std.testing.expectError(error.TooManyImageRows, e.take(&a, 0, gpa, &out));
     e.forget(&a);
     try std.testing.expectEqual(@as(u32, 0), fake.encodes.load(.acquire));
+}
+
+fn waitEntered(f: *Fake) void {
+    while (f.entered.load(.acquire) == 0) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+}
+
+const four = [_]Image{ .{ .at = 0, .tokens = 1, .bytes = &.{ 1, 1 } }, .{ .at = 2, .tokens = 1, .bytes = &.{ 1, 2 } }, .{ .at = 4, .tokens = 1, .bytes = &.{ 1, 3 } }, .{ .at = 6, .tokens = 1, .bytes = &.{ 1, 4 } } };
+
+test "a request of four pictures forgotten during its first stops before the second" {
+    const gpa = std.testing.allocator;
+    var fake: Fake = .{};
+    fake.hold.store(true, .release);
+    var e = Encoder.init(gpa, std.testing.io, fake.tower(), 8);
+    try e.start();
+    defer e.stop();
+    var woken: Woken = .{};
+    try e.submit(&four, woken.wake());
+    waitEntered(&fake);
+    e.forget(&four);
+    fake.hold.store(false, .release);
+    while (true) {
+        e.lock();
+        const left = e.jobs.items.len;
+        e.unlock();
+        if (left == 0) break;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(u32, 1), fake.encodes.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), woken.n.load(.acquire));
+}
+
+test "stopping the encoder during the first of four pictures waits for that picture only" {
+    const gpa = std.testing.allocator;
+    var fake: Fake = .{};
+    fake.hold.store(true, .release);
+    var e = Encoder.init(gpa, std.testing.io, fake.tower(), 8);
+    try e.start();
+    var joined = false;
+    errdefer if (!joined) {
+        fake.hold.store(false, .release);
+        e.stop();
+    };
+    var woken: Woken = .{};
+    try e.submit(&four, woken.wake());
+    waitEntered(&fake);
+    const stopper = try std.Thread.spawn(.{}, Encoder.stop, .{&e});
+    while (true) {
+        e.lock();
+        const closing = e.closing;
+        e.unlock();
+        if (closing) break;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    fake.hold.store(false, .release);
+    stopper.join();
+    joined = true;
+    try std.testing.expectEqual(@as(u32, 1), fake.encodes.load(.acquire));
 }

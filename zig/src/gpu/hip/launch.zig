@@ -80,8 +80,8 @@ pub const Config = struct {
     }
 };
 
-/// Kernel launches so far in this process (a profile's count by phase).
-pub var count: u64 = 0;
+/// Kernel launches so far on this thread (a profile's count by phase; the vision encoder's thread keeps its own).
+pub threadlocal var count: u64 = 0;
 
 /// A check run before every launch when set (the kit's strict mode: arguments against the kernel's metadata).
 pub var before: ?*const fn (f: Function, cfg: Config, args: *const Args) Error!void = null;
@@ -90,7 +90,7 @@ pub fn launch(f: Function, cfg: Config, stream: Stream, args: *Args) Error!void 
     try cfg.validate();
     if (!cfg.plain()) return error.Unsupported;
     if (before) |hook| try hook(f, cfg, args);
-    _ = @atomicRmw(u64, &count, .Add, 1, .monotonic); // rank 0's encoder thread launches too
+    count += 1;
     const g = cfg.grid;
     const b = cfg.block;
     try f.d.check(f.d.api.hipModuleLaunchKernel(f.handle, g.x, g.y, g.z, b.x, b.y, b.z, cfg.shared, stream.handle, args.pointers(), null), "hipModuleLaunchKernel");
