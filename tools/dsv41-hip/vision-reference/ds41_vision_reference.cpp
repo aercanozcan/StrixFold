@@ -1,10 +1,5 @@
-// DeepSeek V4.1 vision tower: the host reference of the ViT + aligner (the release's inference/vision.py) with the
-// declared arithmetic of docs/models/deepseek-v4.1/vision.md. Every dot product is one FP32 accumulator per output,
-// summed with fused multiply-adds in ascending index order from 0; the device kernels reproduce it bit for bit.
-// Built with -ffp-contract=off and, on x86-64, -mavx2 -mfma (std::fma is a hardware instruction; consecutive outputs
-// vectorise without changing any output's chain). Linked only by tests and tools (strix_ds41_vision_reference);
-// callers check cpu_has_fma() first.
-#include "strix/ds41_vision.hpp"
+// Host reference of the ViT + aligner (inference/vision.py): each dot product one FP32 fma chain over k ascending.
+#include "ds41_vision.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -17,8 +12,7 @@ namespace {
 
 constexpr std::size_t kKeyBlock = kVisionKeyBlock;
 
-// Sum of one key block's probabilities (unused slots 0): 16 groups of 4 consecutive keys, each ((p0 + p1) + p2) + p3,
-// combined by the butterfly g = g + g[c ^ d] for d = 8, 4, 2, 1 (the device's 16-lane shuffle order).
+// A key block's probability sum: 16 groups ((p0 + p1) + p2) + p3, then the butterfly g + g[c ^ d], d = 8, 4, 2, 1.
 float block_sum(const float* p) {
     float g[16], h[16];
     for (int c = 0; c < 16; ++c) g[c] = ((p[4 * c] + p[4 * c + 1]) + p[4 * c + 2]) + p[4 * c + 3];
@@ -47,8 +41,7 @@ void parallel_rows(std::size_t n, unsigned threads, F&& fn) {
     for (auto& t : pool) t.join();
 }
 
-// y[n][o] = bf16(acc + bias[o]) with acc = fma(x[n][k], w[o][k], acc) over k = 0..K-1 (bias optional). x and w BF16.
-// The weights are transposed to FP32 [k][o] so that consecutive outputs vectorise; each output's chain is unchanged.
+// y[n][o] = bf16(acc + bias[o]), acc = fma(x[n][k], w[o][k], acc) over k ascending; w goes FP32 [k][o] to vectorise.
 void linear(const std::uint16_t* x, std::size_t rows, std::size_t K, const std::uint16_t* w, const std::uint16_t* bias, std::size_t O,
             std::uint16_t* y, unsigned threads, std::size_t x_stride = 0) {
     if (x_stride == 0U) x_stride = K;
@@ -135,10 +128,7 @@ std::vector<std::uint16_t> encode_reference(const VisionWeights& w, const Prepar
                         }
                     }
         });
-        // attention per head and query row, keys in blocks of kKeyBlock (online softmax, declared order):
-        //   s_j = (sum_d fma(q[d], k_j[d])) * 0.125;  m' = max(m, max_block s);  a = exp(m - m');  p_j = exp(s_j - m');
-        //   l = l * a;  l = l + block_sum(p);  o = o * a;  for j in the block ascending: o[d] = fma(p_j, v_j[d], o[d]);
-        //   out = bf16(o / l)
+        // attention per head and row, keys in blocks of kKeyBlock (online softmax; the order below, out = bf16(o / l))
         for (std::size_t hh = 0; hh < H; ++hh) {
             std::vector<float> kk(N * HD), vv(N * HD);
             for (std::size_t j = 0; j < N; ++j)
@@ -193,7 +183,7 @@ std::vector<std::uint16_t> encode_reference(const VisionWeights& w, const Prepar
     }
     rms_norm(x.data(), N, D, w.norm, c.eps, h.data(), threads);
     if (observer) observer("norm", 0, h);
-    // 3 x 3 unfold (zero beyond the grid): feature ch * 9 + ki * 3 + kj of cell (lh, lw) reads patch (3 lh + ki, 3 lw + kj)
+    // 3 x 3 unfold (0 past the grid): feature ch * 9 + ki * 3 + kj of cell (lh, lw) is patch (3 lh + ki, 3 lw + kj)
     const auto& g = img.plan;
     const std::size_t L = g.cells(), M = c.merge, F = c.merged_in();
     std::vector<std::uint16_t> unf(L * F, 0);

@@ -1,14 +1,12 @@
 #pragma once
-// DeepSeek V4.1 vision tower: the element-wise declared arithmetic shared by the host reference (ds41_vision.cpp)
-// and the device kernels (hip_ds41_vision.hip), from basic IEEE operations only (no library transcendental, no
-// contraction) so both give the same bits. docs/models/deepseek-v4.1/vision.md, "Declared arithmetic".
-#include "strix/ds41_moe.hpp"  // declared_exp, declared_sqrt, STRIX_DS41_HD
+// The vision tower's element-wise declared arithmetic: basic IEEE operations only, so host and device agree bitwise.
+#include "declared.hpp"  // declared_exp, declared_sqrt, STRIX_DS41_HD
 
 #include <cstdint>
 
 namespace strix::deepseek41::vision {
 
-// Attention keys are taken in blocks of this many (online softmax; docs/models/deepseek-v4.1/vision.md).
+// Attention keys are taken in blocks of this many (online softmax).
 inline constexpr unsigned kVisionKeyBlock = 64;
 
 // Round to BF16, nearest even (torch's .to(torch.bfloat16)); NaN stays a quiet NaN.
@@ -20,9 +18,7 @@ STRIX_DS41_HD inline std::uint16_t bf16_round(float v) {
 }
 STRIX_DS41_HD inline float bf16_float(std::uint16_t b) { return __builtin_bit_cast(float, static_cast<std::uint32_t>(b) << 16U); }
 
-// erf(x): the fdlibm/musl erff rational approximations (|x| < 0.84375: x + x * P(x^2)/Q(x^2); < 1.25: around 1;
-// < 6: 1 - exp(-z^2 - 0.5625) exp((z - x)(z + x) + R/S) / x with z the high half of x; beyond: +-1), with
-// declared_exp for exp. Each step is one IEEE operation.
+// erff of fdlibm as musl carries it (FreeBSD s_erff.c). Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved. Developed at SunPro, a Sun Microsystems, Inc. business. Permission to use, copy, modify, and distribute this software is freely granted, provided that this notice is preserved.
 STRIX_DS41_HD inline float declared_erf(float x) {
     const std::uint32_t bits = __builtin_bit_cast(std::uint32_t, x);
     const bool negative = (bits >> 31U) != 0U;
@@ -63,9 +59,7 @@ STRIX_DS41_HD inline float declared_erf(float x) {
     return negative ? -y : y;
 }
 
-// Wave-order sum (as engine-lab's other device reductions): lane l of 32 holds the ascending sum of its elements
-// l, l + 32, ...; the lanes combine by the butterfly v = v + v[l ^ d] for d = 16, 8, 4, 2, 1. Host form of the
-// butterfly on the 32 lane partials; every lane ends with the same value.
+// Wave-order sum: lane l of 32 sums elements l, l + 32, ... ascending; the butterfly v + v[l ^ d], d = 16 .. 1.
 inline float wave_sum_host(const float* partial) {
     float p[32], q[32];
     for (int l = 0; l < 32; ++l) p[l] = partial[l];

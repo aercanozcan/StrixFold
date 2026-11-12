@@ -1,10 +1,5 @@
-// DeepSeek V4.1 image preprocessing, equal to the release's inference/image_processor.py (load_image) with Pillow
-// 11.3: plan_image_grid / safe_resize / solve_resize_ratio in double precision with Python's operation order,
-// ImageOps.pad (contain + paste on (127, 127, 127)) with Pillow's 8-bit BICUBIC resample (Resample.c), and
-// ((x / 255) - 0.5) / 0.5 in FP32 rounded to BF16. Built with -ffp-contract=off.
-#include "strix/ds41_vision.hpp"
-
-#include "strix/model_content_hash.hpp"
+// Image prep equal to the release's image_processor.py with Pillow 11.3 (grid plan, 8-bit BICUBIC pad, BF16 patches).
+#include "ds41_vision.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -231,22 +226,6 @@ image::Rgb8 pad(const image::Rgb8& in, std::uint32_t width, std::uint32_t height
     return out;
 }
 
-std::array<std::uint8_t, 32> prepared_digest(const GridPlan& g, std::span<const std::uint16_t> patches) {
-    Sha256Fast h;
-    std::uint8_t head[24];
-    const std::uint32_t f[6] = {g.best_h, g.best_w, g.vit_h, g.vit_w, g.llm_h, g.llm_w};
-    for (int i = 0; i < 6; ++i)
-        for (int b = 0; b < 4; ++b) head[i * 4 + b] = static_cast<std::uint8_t>(f[i] >> (8 * b));
-    h.update(std::as_bytes(std::span(head)));
-    std::vector<std::uint8_t> le(patches.size() * 2U);
-    for (std::size_t i = 0; i < patches.size(); ++i) {
-        le[2U * i] = static_cast<std::uint8_t>(patches[i]);
-        le[2U * i + 1U] = static_cast<std::uint8_t>(patches[i] >> 8U);
-    }
-    h.update(std::as_bytes(std::span(le)));
-    return h.finalize().bytes;
-}
-
 PreparedImage prepare(const image::Rgb8& picture, const VisionConfig& cfg) {
     if (picture.width == 0U || picture.height == 0U) throw image::ImageError("image input: empty picture");
     PreparedImage out;
@@ -270,12 +249,7 @@ PreparedImage prepare(const image::Rgb8& picture, const VisionConfig& cfg) {
                 for (std::uint32_t ky = 0; ky < p; ++ky)
                     for (std::uint32_t kx = 0; kx < p; ++kx)
                         out.patches[o++] = lut[padded.pixels[(std::size_t{py * p + ky} * g.best_w + px * p + kx) * 3U + c]];
-    out.digest = prepared_digest(g, out.patches);
     return out;
-}
-
-PreparedImage prepare_bytes(std::span<const std::uint8_t> encoded, const VisionConfig& cfg, const image::DecodeLimits& limits) {
-    return prepare(image::decode_image(encoded, limits), cfg);
 }
 
 SpanKind span_kind(const GridPlan& g, std::uint32_t i, std::uint32_t* cell) noexcept {

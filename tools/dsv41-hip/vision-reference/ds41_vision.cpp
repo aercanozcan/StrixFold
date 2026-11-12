@@ -1,44 +1,109 @@
-// DeepSeek V4.1 vision tower, host side: the deepseek4-vision GGUF (configuration and BF16 weights), the 2D rotary
-// tables and the host reference of the ViT + aligner (the release's inference/vision.py) with the declared
-// arithmetic of docs/models/deepseek-v4.1/vision.md. Every dot product is one FP32 accumulator per output, summed
-// with fused multiply-adds in ascending index order from 0; the device kernels reproduce it bit for bit.
-// Built with -ffp-contract=off.
-#include "strix/ds41_vision.hpp"
-
-#include "strix/gguf_reader.hpp"
-#include "strix/model_input.hpp"
+// Vision tower host side: the sidecar's BF16 weights (vision.safetensors), the 2D rotary tables and the span rows.
+#include "ds41_vision.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <map>
 #include <stdexcept>
 
 namespace strix::deepseek41::vision {
 namespace {
 
-[[noreturn]] void fail(const std::string& what) { throw std::runtime_error("vision file: " + what); }
+[[noreturn]] void fail(const std::string& what) { throw std::runtime_error("vision sidecar: " + what); }
 
-const gguf::MetadataEntry& meta(const gguf::FileInfo& f, const std::string& key) {
-    const auto* e = f.find_metadata(key);
-    if (!e) fail("missing metadata " + key);
-    return *e;
-}
-std::uint64_t meta_u(const gguf::FileInfo& f, const std::string& key) {
-    const auto& e = meta(f, key);
-    if (e.unsigned_value) return *e.unsigned_value;
-    if (e.signed_value && *e.signed_value >= 0) return static_cast<std::uint64_t>(*e.signed_value);
-    fail(key + " is not a non-negative integer");
-}
-double meta_f(const gguf::FileInfo& f, const std::string& key) {
-    const auto& e = meta(f, key);
-    if (e.floating_value) return *e.floating_value;
-    if (e.unsigned_value) return static_cast<double>(*e.unsigned_value);
-    if (e.signed_value) return static_cast<double>(*e.signed_value);
-    fail(key + " is not a number");
-}
-std::uint32_t u32(std::uint64_t v, const char* what) {
-    if (v == 0U || v > 1'000'000U) fail(std::string("implausible ") + what);
-    return static_cast<std::uint32_t>(v);
+// The little JSON a safetensors header holds: objects, arrays, strings, non-negative integers (enough for it).
+struct Json {
+    enum Kind { null, number, string, array, object } kind = null;
+    std::uint64_t n = 0;
+    std::string s;
+    std::vector<Json> a;
+    std::map<std::string, Json> o;
+};
+
+struct Parser {
+    const std::string& t;
+    std::size_t i = 0;
+    void ws() {
+        while (i < t.size() && (t[i] == ' ' || t[i] == '\n' || t[i] == '\r' || t[i] == '\t')) ++i;
+    }
+    char peek() {
+        ws();
+        if (i >= t.size()) fail("truncated header");
+        return t[i];
+    }
+    void expect(char c) {
+        if (peek() != c) fail(std::string("header: expected '") + c + "' at byte " + std::to_string(i));
+        ++i;
+    }
+    std::string str() {
+        expect('"');
+        std::string out;
+        while (i < t.size() && t[i] != '"') {
+            if (t[i] == '\\') {
+                if (++i >= t.size()) break;
+                const char e = t[i];
+                if (e == 'u') fail("header: \\u escapes are not expected in tensor names");
+                out += e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e == 'b' ? '\b' : e == 'f' ? '\f' : e;
+            } else {
+                out += t[i];
+            }
+            ++i;
+        }
+        expect('"');
+        return out;
+    }
+    Json value(int depth) {
+        if (depth > 8) fail("header nests too deep");
+        Json v;
+        const char c = peek();
+        if (c == '{') {
+            v.kind = Json::object;
+            ++i;
+            if (peek() == '}') return ++i, v;
+            for (;;) {
+                std::string k = str();
+                expect(':');
+                v.o[k] = value(depth + 1);
+                if (peek() == '}') return ++i, v;
+                expect(',');
+            }
+        }
+        if (c == '[') {
+            v.kind = Json::array;
+            ++i;
+            if (peek() == ']') return ++i, v;
+            for (;;) {
+                v.a.push_back(value(depth + 1));
+                if (peek() == ']') return ++i, v;
+                expect(',');
+            }
+        }
+        if (c == '"') {
+            v.kind = Json::string;
+            v.s = str();
+            return v;
+        }
+        if (c >= '0' && c <= '9') {
+            v.kind = Json::number;
+            while (i < t.size() && t[i] >= '0' && t[i] <= '9') v.n = v.n * 10U + static_cast<std::uint64_t>(t[i++] - '0');
+            return v;
+        }
+        if (t.compare(i, 4, "null") == 0) return i += 4, v;
+        fail("header: unexpected byte at " + std::to_string(i));
+    }
+};
+
+std::vector<std::uint64_t> integers(const Json& v, const std::string& what) {
+    if (v.kind != Json::array) fail(what + " is not an array");
+    std::vector<std::uint64_t> out;
+    for (const auto& x : v.a) {
+        if (x.kind != Json::number) fail(what + " holds a non-integer");
+        out.push_back(x.n);
+    }
+    return out;
 }
 
 }  // namespace
@@ -57,33 +122,28 @@ const VisionWeights::Tensor* VisionWeights::find(const std::string& name) const 
     return nullptr;
 }
 
-VisionWeights load_vision_file(const std::filesystem::path& path, bool metadata_only) {
-    gguf::Limits limits;
-    const auto f = gguf::read_file(path, limits);
+VisionWeights load_vision_sidecar(const std::filesystem::path& dir) {
+    const auto path = dir / "vision.safetensors";
+    std::ifstream in(path, std::ios::binary);
+    if (!in) fail("cannot open " + path.string());
     VisionWeights w;
-    w.file_bytes = f.file_size;
-    const auto arch = meta(f, "general.architecture").string_value;
-    if (!arch || *arch != "deepseek4-vision") fail("general.architecture is not deepseek4-vision");
-    if (const auto* rev = f.find_metadata("general.source.revision"); rev && rev->string_value) w.source_revision = *rev->string_value;
-    auto& c = w.config;
-    const std::string p = "deepseek4-vision.";
-    c.layers = u32(meta_u(f, p + "block_count"), "block_count");
-    c.dim = u32(meta_u(f, p + "embedding_length"), "embedding_length");
-    c.inter = u32(meta_u(f, p + "feed_forward_length"), "feed_forward_length");
-    c.heads = u32(meta_u(f, p + "attention.head_count"), "head_count");
-    c.out_dim = u32(meta_u(f, p + "projection_length"), "projection_length");
-    c.patch = u32(meta_u(f, p + "patch_size"), "patch_size");
-    c.merge = u32(meta_u(f, p + "downsample_ratio"), "downsample_ratio");
-    c.max_tokens = u32(meta_u(f, p + "image.max_tokens"), "image.max_tokens");
-    c.min_pixels = static_cast<std::uint32_t>(meta_u(f, p + "image.min_pixels"));
-    c.image_token_id = u32(meta_u(f, p + "image.token_id"), "image.token_id");
-    c.theta = static_cast<float>(meta_f(f, p + "rope.freq_base"));
-    c.eps = static_cast<float>(meta_f(f, p + "attention.layer_norm_rms_epsilon"));
-    if (const double r = meta_f(f, p + "image.max_width_height_ratio"); r > 0.0) c.max_wh_ratio = r;
+    w.file_bytes = std::filesystem::file_size(path);
+    std::uint8_t len_le[8];
+    in.read(reinterpret_cast<char*>(len_le), 8);
+    std::uint64_t hlen = 0;
+    for (int b = 7; b >= 0; --b) hlen = (hlen << 8U) | len_le[b];
+    if (!in || hlen > (64ULL << 20U) || 8U + hlen > w.file_bytes) fail("bad header length");
+    std::string text(static_cast<std::size_t>(hlen), '\0');
+    in.read(text.data(), static_cast<std::streamsize>(hlen));
+    if (!in) fail("short header");
+    Parser parser{text};
+    const Json head = parser.value(0);
+    if (head.kind != Json::object) fail("header is not an object");
+    const std::uint64_t base = 8U + hlen;
+    const auto& c = w.config;
     if (c.dim % c.heads != 0U || c.head_dim() % 4U != 0U) fail("head geometry");
-    if (c.max_wh_ratio) fail("image.max_width_height_ratio is not supported (null in the release)");
 
-    // expected tensors and shapes ([out][in] as GGUF ne0 = in, ne1 = out)
+    // expected tensors and shapes (safetensors shape [out, in], as torch's)
     struct Want {
         std::string name;
         std::uint64_t in, out;  // out = 0: a vector of `in`
@@ -105,28 +165,30 @@ VisionWeights load_vision_file(const std::filesystem::path& path, bool metadata_
         want.push_back({b + "mlp.w1.weight", c.dim, 2ULL * c.inter});
         want.push_back({b + "mlp.w2.weight", c.inter, c.dim});
     }
-    if (f.tensors.size() != want.size()) fail("expected " + std::to_string(want.size()) + " tensors, the file has " + std::to_string(f.tensors.size()));
+    if (head.o.size() - head.o.count("__metadata__") != want.size())
+        fail("expected " + std::to_string(want.size()) + " tensors, the file has " + std::to_string(head.o.size() - head.o.count("__metadata__")));
     std::size_t total = 0;
-    std::vector<const gguf::TensorInfo*> infos;
+    std::vector<std::uint64_t> starts;
     for (const auto& wt : want) {
-        const auto it = std::find_if(f.tensors.begin(), f.tensors.end(), [&](const auto& t) { return t.name == wt.name; });
-        if (it == f.tensors.end()) fail("missing tensor " + wt.name);
-        if (it->ggml_type != 30U) fail(wt.name + " is not BF16");
-        const std::vector<std::uint64_t> dims = wt.out ? std::vector<std::uint64_t>{wt.in, wt.out} : std::vector<std::uint64_t>{wt.in};
-        if (it->dimensions != dims) fail(wt.name + " has an unexpected shape");
+        const auto it = head.o.find(wt.name);
+        if (it == head.o.end() || it->second.kind != Json::object) fail("missing tensor " + wt.name);
+        const auto& t = it->second.o;
+        const auto dtype = t.find("dtype"), shape = t.find("shape"), offsets = t.find("data_offsets");
+        if (dtype == t.end() || dtype->second.s != "BF16") fail(wt.name + " is not BF16");
+        const std::vector<std::uint64_t> dims = wt.out ? std::vector<std::uint64_t>{wt.out, wt.in} : std::vector<std::uint64_t>{wt.in};
+        if (shape == t.end() || integers(shape->second, wt.name + " shape") != dims) fail(wt.name + " has an unexpected shape");
         const std::size_t elements = static_cast<std::size_t>(wt.out ? wt.in * wt.out : wt.in);
-        if (it->byte_size != elements * 2U) fail(wt.name + " byte size");
+        const auto span = offsets == t.end() ? std::vector<std::uint64_t>{} : integers(offsets->second, wt.name + " data_offsets");
+        if (span.size() != 2U || span[1] < span[0] || span[1] - span[0] != elements * 2U) fail(wt.name + " byte size");
+        if (base + span[1] > w.file_bytes) fail(wt.name + " lies past the end of the file");
         w.tensors.push_back({wt.name, {total, elements}});
         total += elements;
-        infos.push_back(&*it);
+        starts.push_back(base + span[0]);
     }
-    if (metadata_only) return w;
     w.blob.resize(total);
-    ModelInput in(path);
-    if (!in) fail("cannot open " + path.string());
-    for (std::size_t i = 0; i < infos.size(); ++i) {
-        in.seekg(static_cast<std::streamoff>(infos[i]->absolute_offset));
-        in.read(reinterpret_cast<char*>(w.blob.data() + w.tensors[i].second.offset), static_cast<std::streamsize>(infos[i]->byte_size));
+    for (std::size_t i = 0; i < starts.size(); ++i) {
+        in.seekg(static_cast<std::streamoff>(starts[i]));
+        in.read(reinterpret_cast<char*>(w.blob.data() + w.tensors[i].second.offset), static_cast<std::streamsize>(w.tensors[i].second.elements * 2U));
         if (!in) fail("short read of " + w.tensors[i].first);
     }
     const auto view = [&](const std::string& name) { return w.blob.data() + w.find(name)->offset; };

@@ -127,6 +127,14 @@ to float by Ian Lance Taylor, Cygnus Support), under this notice, kept in that f
 
 The file's kernels themselves were written by Daniel Turini for this port.
 
+`tools/dsv41-hip/vision-reference/` (the vision tower's host reference, which makes the golden dumps
+`tf-dsv41-vision-check` reads) holds the same helpers: `declared.hpp` is `declared_exp`, `declared_sqrt` and
+`STRIX_DS41_HD` of hyukudan/strix-halo-engine-lab's `include/strix/ds41_moe.hpp`, code unchanged, Apache License 2.0
+(`LICENSES/Apache-2.0.txt`), and the `declared_erf` of its `ds41_vision_math.hpp` follows fdlibm's `erff` under the
+SunPro notice above, kept in that file. Its prep (`ds41_vision_prep.cpp`) computes Pillow's 8-bit BICUBIC resample as
+`picture.zig` does (Pillow's `Resample.c` coefficients; Pillow, MIT-CMU License, `LICENSES/Pillow-MIT-CMU.txt`). Its
+other sources were written by Daniel Turini for strix-halo-engine-lab (Apache-2.0) and adapted here.
+
 TensorFold ships no model weights. The `z-lab/Qwen3.8-27B-DFlash2` model card states Apache-2.0.
 The optional `incoai/GLM-5.3-Flash-DFlash2` model card states CC BY-NC-ND 4.0, for non-commercial use
 without derivatives. Each checkpoint keeps its own license.
