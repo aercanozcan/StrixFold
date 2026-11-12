@@ -121,8 +121,7 @@ pub fn dense(kit: *const gpu.Kit) !?dense_mod.Kernels {
     return .{ .gemv = gemv orelse return error.MissingKernel, .swiglu = swiglu orelse return error.MissingKernel };
 }
 
-/// vision.hip's kernels (the vision tower, for MODALITIES=text_image): null when the kit has none of them, an error
-/// when it has only some.
+/// vision.hip's kernels (the tower, for text_image): null when the kit has none of them, an error when only some.
 pub fn vision(kit: *const gpu.Kit) !?vit_hip.Kernels {
     const vp = vit_hip.params;
     const k: vit_hip.Kernels = .{

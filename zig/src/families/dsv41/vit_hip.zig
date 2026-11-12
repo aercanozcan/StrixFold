@@ -1,10 +1,4 @@
-//! The vision tower and aligner on HIP (gfx1151): vit.zig's Tower (open / close / reserve / encode / spanRows, the same
-//! probes) over the kit's vision.* kernels (zig/kernels/hip/dsv41/vision.hip), engineLab's declared arithmetic, so each
-//! step's bytes are its host reference's (encode_reference) and its device tower's: the patch embed and every linear
-//! one FP32 fma chain over k ascending per output (bf16 after the bias), RMSNorm a wave-order sum, attention a fused
-//! online softmax over 64-key tiles, the 2D RoPE tables built here on the host (double precision, libc's pow / cos /
-//! sin, as the reference builds them). Not torch's kernels: the rows are not CUDA's vit.zig bytes (cosine ~0.999 to
-//! torch's FP32 tower). Rank 0 runs it; the span rows go into the prompt in place of the image tokens' embeddings.
+//! The vision tower and aligner on HIP: vit.zig's Tower over vision.hip's kernels, numerics in ADAPTER.md 8.1.
 const std = @import("std");
 const gpu = @import("gpu");
 const core = @import("core");
@@ -51,8 +45,7 @@ pub const params = struct {
 
 const Block = struct { norm1: u64, wqkv: u64, bqkv: u64, wo: u64, bo: u64, norm2: u64, w1: u64, w2: u64 };
 
-/// One step's output a gate checks (null: no probe): patch embed, the RoPE tables, each block, the final norm, the
-/// aligner rows (vit.zig's names).
+/// One step's output a gate checks (null: no probe), by vit.zig's names: patch embed, RoPE, blocks, norm, aligner.
 pub const Probe = struct {
     ctx: *anyopaque,
     f: *const fn (ctx: *anyopaque, what: []const u8, index: usize, ptr: u64, bytes: usize) anyerror!void,
@@ -62,8 +55,7 @@ pub const Probe = struct {
     }
 };
 
-/// The largest picture a span of `max_tokens` holds: its aligner cells (n_llm_h * n_llm_w with n_llm_h * (n_llm_w + 1)
-/// + 2 <= max_tokens) and patches (merge^2 a cell at most); 1021 and 9189 for 1024 (engineLab's max_cells).
+/// The most aligner cells a span of `max_tokens` holds (h * w with h * (w + 1) + 2 <= it): engineLab's max_cells.
 pub fn maxCells(max_tokens: usize) usize {
     var best: usize = 0;
     var h: usize = 1;
@@ -75,7 +67,7 @@ pub fn maxCells(max_tokens: usize) usize {
     return best;
 }
 
-/// The checkpoint's (or the sidecar's) shards that hold the vision tensors, by model.safetensors.index.json's weight_map.
+/// The checkpoint's (or the sidecar's) shards that hold the vision tensors, by its index's weight_map.
 const Sources = struct {
     gpa: std.mem.Allocator,
     files: std.ArrayList(st.File) = .empty,
@@ -181,8 +173,7 @@ pub const Tower = struct {
         errdefer buf.free();
         const ptrs = try gpa.alloc(u64, keys.items.len);
         defer gpa.free(ptrs);
-        // each tensor through anonymous memory first (a copy straight from the file mapping crawls), one at a time:
-        // the host holds at most the largest tensor (aligner.w1, 94 MB), never the tower's 926 MB
+        // each tensor through anonymous memory, one at a time (a copy straight from the file mapping crawls)
         var tmp: std.ArrayList(u8) = .empty;
         defer tmp.deinit(std.heap.page_allocator);
         var at: usize = 0;
@@ -267,8 +258,7 @@ pub const Tower = struct {
         return tw.weight_bytes + if (tw.work) |w| w.len else 0;
     }
 
-    /// Tower.encode of one picture (its patches on the host, bf16): the aligner's rows bf16 [n_llm_h * n_llm_w, 5120],
-    /// left in the workspace (the returned address) until the next call. The picture must fit the reserved workspace.
+    /// One picture's aligner rows bf16 [cells, 5120] from its host patches, at the returned address until the next.
     pub fn encode(tw: *Tower, g: picture.Grid, patches: []const u16, probe: ?Probe) !u64 {
         const n = g.patches();
         const l = g.n_llm_h * g.n_llm_w;
@@ -317,8 +307,7 @@ pub const Tower = struct {
         try add(k, s, w.x, w.tmp, n * dim);
     }
 
-    /// Tower.span_rows: the image span's rows bf16 [span tokens, 5120] into `out` (device), the delimiters' learned
-    /// embeddings around the aligner's rows (encode's output at `rows`). `scratch` is unused on HIP.
+    /// The span's rows bf16 [span tokens, 5120] into `out`: the delimiters around encode's `rows` (`scratch` unused).
     pub fn spanRows(tw: *Tower, g: picture.Grid, rows: u64, out: u64, scratch: u64) !void {
         _ = scratch;
         try span(tw.k, tw.stream, rows, tw.image_start, tw.image_newline, tw.image_end, out, g.n_llm_w, g.n_llm_h);
@@ -434,9 +423,7 @@ extern "c" fn pow(x: f64, y: f64) f64;
 extern "c" fn cos(x: f64) f64;
 extern "c" fn sin(x: f64) f64;
 
-/// engineLab's rope_tables: for patch r (row r / n_vit_w, column r % n_vit_w) and pair j of 32, angle = f32(row or
-/// column) * inv[j % 16] in fp32 (rows for j < 16, columns after), inv[j] = f32(1 / pow(theta, 2 j / 32)) in double;
-/// cos and sin of the angle in double (libc, as the reference calls std::cos / std::sin), rounded to fp32.
+/// engineLab's rope_tables: angle = f32(row if j < 16 else column) * f32(1 / pow(theta, (j % 16) / 16)), libc cos, sin.
 pub fn ropeTables(g: picture.Grid, cos_out: *std.ArrayList(f32), sin_out: *std.ArrayList(f32)) !void {
     const half = head_dim / 2;
     const quarter = half / 2;

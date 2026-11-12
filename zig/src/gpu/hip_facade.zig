@@ -7,8 +7,7 @@ pub const Backend = enum { cuda, hip };
 pub const backend: Backend = .hip;
 
 /// What the family may ask of this backend. CUDA-only launch features are absent; verbs RDMA and the four-node 2D split
-/// are not implemented on HIP (ADAPTER.md sections 2 and 8). Vision: the tower on the AMD kit's vision.* kernels
-/// (vit_hip.zig), opened only when a rank serves text_image (the HIP default stays text).
+/// are not implemented on HIP (ADAPTER.md sections 2 and 8); vision is vit_hip.zig, opened for text_image only.
 pub const features = .{ .pdl = false, .clusters = false, .vision = true, .verbs_rdma = false, .l2_prefetch = false, .world4 = false };
 
 pub const abi = rt.abi;

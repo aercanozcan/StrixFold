@@ -1,15 +1,4 @@
-//! tf-dsv41-vision-check: the HIP vision tower (vit_hip.zig on the kit's vision.* kernels) against engineLab's host
-//! reference, byte for byte, step by step.
-//!   tf-dsv41-vision-check --golden DIR [--kit DIR --weights DIR] [--case NAME]... [--out DIR] [--prep-only]
-//! DIR (--golden) holds one folder a case, as tools/vision-golden writes them from engineLab's encode_reference:
-//! grid.json, rgb.u8 (the decoded picture), patches.bf16, cos.f32 / sin.f32 (the RoPE tables), embed.bf16,
-//! block00..31.bf16, norm.bf16, rows.bf16 and span.bf16. For each case:
-//!  - prep (no GPU): picture.zig's grid and patches of rgb.u8 equal grid.json's and patches.bf16;
-//!  - the tower (with --kit / --weights): encode of patches.bf16 with a probe on every step (the host RoPE tables,
-//!    the patch embed, all 32 blocks, the final norm, the aligner rows) and the span, each equal to its file (the
-//!    first difference named: step, row, column, both values); then two encodes without the probe, timed, whose span
-//!    rows must equal the probed run's (determinism). --out writes each case's span rows there (rows.bf16, span.bf16).
-//! Exit 0 only when every check of every case passes. Run with the GPU to itself (strixfold-container, pair stopped).
+//! tf-dsv41-vision-check: the HIP vision tower against engineLab's encode_reference dumps, byte for byte, by step.
 const std = @import("std");
 const gpu = @import("gpu");
 const dsv41 = @import("dsv41");
@@ -132,6 +121,7 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("usage: tf-dsv41-vision-check --golden DIR [--kit DIR --weights DIR] [--case NAME]... [--out DIR] [--prep-only]\n", .{});
         return 2;
     }
+    // every case folder of --golden (tools/vision-golden: grid.json, rgb.u8, patches.bf16, each step's .bf16 / .f32)
     if (cases.items.len == 0) {
         var dir = try std.Io.Dir.cwd().openDir(io, golden.?, .{ .iterate = true });
         defer dir.close(io);
@@ -149,7 +139,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     var failed: usize = 0;
-    // prep: picture.zig on the decoded RGB
+    // prep (no GPU): picture.zig's grid and patches of rgb.u8 against grid.json's and patches.bf16
     for (cases.items) |name| {
         const c = try readCase(a, io, golden.?, name);
         const rgb_bytes = try readFile(a, io, c.dir, "rgb.u8");
@@ -164,6 +154,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
     if (prep_only) return if (failed == 0) 0 else 1;
 
+    // the GPU to itself (the pair stopped): the timed encodes below are its alone
     var d = try gpu.Driver.open();
     defer d.close();
     var ctx = try gpu.Context.init(&d, 0);
@@ -186,6 +177,7 @@ pub fn main(init: std.process.Init) !u8 {
     var span = try gpu.DeviceBuffer.alloc(&d, 1024 * vit.model_dim * 2);
     defer span.free();
 
+    // the tower: a probe on each of 37 steps, then the span, each against its file (the first difference named)
     for (cases.items) |name| {
         const c = try readCase(a, io, golden.?, name);
         const read = try readFile(a, io, c.dir, "patches.bf16");
@@ -219,6 +211,7 @@ pub fn main(init: std.process.Init) !u8 {
         const ok = p.failed == 0 and span_diff.len == 0 and same and p.checked == 37;
         if (!ok) failed += 1;
         std.debug.print("{s} tower {s}: {d} patches, {d} cells, {d} span tokens; {d} of {d} steps equal, span {s}, repeat {s}; encode {d} / {d} ms\n", .{ if (ok) "PASS" else "FAIL", name, c.grid.patches(), c.grid.n_llm_h * c.grid.n_llm_w, t, p.checked - p.failed, p.checked, if (span_diff.len == 0) "equal" else "DIFFERS", if (same) "equal" else "DIFFERS", ms[0], ms[1] });
+        // --out: this case's aligner rows and span rows (rows.bf16, span.bf16)
         if (out) |o| {
             const dir = try std.fs.path.join(a, &.{ o, name });
             try std.Io.Dir.cwd().createDirPath(io, dir);

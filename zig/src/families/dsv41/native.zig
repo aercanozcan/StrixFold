@@ -23,10 +23,6 @@
 //!   TF_DS_L2_PREFETCH=1                         the paced L2 prefetch of the next kernels' weights
 //!   TF_DS_ENGRAM_AIO=1                          a round's Engram reads by Linux AIO on O_DIRECT
 //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
-//!   TF_DS_MODALITIES                            text (HIP's default) or text_image: the vision tower on rank 0
-//!   TF_DS_VISION_DIR                            HIP, text_image: the vision tower's weights (a sidecar with its own
-//!                                               model.safetensors.index.json, kit/make_vision_sidecar.py; unset: the
-//!                                               model directory's index)
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the
@@ -197,10 +193,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
     };
     errdefer if (st.vocab) |v| v.deinit(gpa);
     st.lanes.vocab = st.vocab;
-    // a vision checkpoint's tower on this rank (CUDA: from the kit's vision/, torch's attention cubin; HIP: the sidecar
-    // TF_DS_VISION_DIR and the AMD kit's vision kernels; both: the routing bias), unless this rank serves text only:
-    // config.json still declares the tower, nothing of it is opened, and the server refuses image parts
-    // (Loaded.vision null)
+    // a vision checkpoint's tower on this rank (CUDA: the kit's vision/; HIP: TF_DS_VISION_DIR, a sidecar made by
+    // make_vision_sidecar.py, else the model's index), unless this rank serves text only: config.json still declares
+    // the tower, nothing of it is opened, and the server refuses image parts (Loaded.vision null)
     st.vision = null;
     if (st.m.cfg.vision and mods == .text) std.log.info("config.json declares a vision tower; not opened (text capability)", .{});
     if (gpu.features.vision and st.m.cfg.vision and mods == .text_image) {

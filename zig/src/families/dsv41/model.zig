@@ -37,8 +37,7 @@ const rdma = @import("rdma.zig");
 /// What a served request may carry (ADAPTER.md D13): text, or text with images when the vision tower is opened. The
 /// checkpoint's config.json is never changed: a text model keeps its vision_config and simply never opens the tower.
 pub const Modalities = enum { text, text_image };
-/// CUDA keeps serving images when the checkpoint has a tower; HIP serves text unless asked for text_image
-/// (TF_DS_MODALITIES / --modalities): its tower needs the vision sidecar and the kit's vision kernels.
+/// CUDA keeps serving images when the checkpoint has a tower; HIP serves text unless asked (TF_DS_MODALITIES).
 pub const default_modalities: Modalities = if (gpu.backend == .cuda and gpu.features.vision) .text_image else .text;
 
 /// CUDA-only state (gpu.features): NCCL behind the collectives, the four-node split, its RDMA rings. Empty on HIP.
@@ -475,12 +474,9 @@ pub const Model = struct {
         // a vision checkpoint's image routing bias (without it a prompt with images is refused; text runs as ever)
         if (gpu.features.vision and c.vision and o.modalities == .text_image) {
             const path = o.vision_bias orelse try std.fs.path.join(a, &.{ o.kit_dir, "vision", "gate_bias_vl.safetensors" });
-            // HIP: both ranks need it (rank 1 has no tower whose open would refuse its absence; a rank without it would
-            // refuse the image spans its peer routes), so a text_image rank without the file does not start
+            // HIP: both ranks need it (a rank without it would refuse the spans its peer routes): none starts without
             m.loadVisionBias(path) catch |err| if (gpu.backend == .hip or o.vision_bias != null or err != error.FileNotFound) return if (err == error.FileNotFound) error.NoVisionKit else err;
-            // HIP: a request's image rows (image_rows_reserved of them, the most it may have) on the device from the
-            // start, so a prompt with images allocates nothing on either rank (a rank-1-only allocation failure would
-            // leave the ranks with different spans)
+            // HIP: a request's image rows at most, from the start: an image prompt allocates nothing on either rank
             if (gpu.backend == .hip) m.img_buf = try gpu.DeviceBuffer.alloc(m.ctx.d, image_rows_reserved * c.hidden * 2);
         }
 

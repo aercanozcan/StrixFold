@@ -21,8 +21,7 @@ const draft = @import("draft.zig");
 const sampling = @import("sampling.zig");
 const link = @import("link.zig");
 const gpu = @import("gpu");
-/// The vision tower's type (gpu.features.vision: CUDA's vit.zig, HIP's vit_hip.zig behind vision.zig); an empty type
-/// in a build without one.
+/// The vision tower's type (vision.zig: CUDA's vit.zig, HIP's vit_hip.zig); an empty type in a build without one.
 pub const VisionTower = if (gpu.features.vision) @import("vision.zig").Vision else opaque {};
 const Encoder = @import("encoder.zig").Encoder;
 
@@ -1305,11 +1304,12 @@ pub fn survivals(conf: []const f32, out: []f64) void {
     }
 }
 
-/// TF_DS_TEST_FAULT (recovery tests only; unset: never): one injected failure in this process's image path, the first
-/// time it is reached. tower: rank 0 refuses a picture before its tower runs; fill_images:K: rank 0 fails a prompt
-/// after sending K pieces of its image rows to rank 1 (an error that does not break the pair); set_images: rank 1
-/// fails to take a prompt's complete image rows.
-const Fault = enum { tower, fill_images, set_images };
+/// TF_DS_TEST_FAULT (recovery tests only; unset: never): one injected image-path failure, the first time it is reached.
+const Fault = enum {
+    tower, // rank 0 refuses a picture at its prompt pass
+    fill_images, // fill_images:K: rank 0 fails a prompt after sending K pieces of its rows to rank 1 (the pair stays)
+    set_images, // rank 1 fails to take a prompt's complete image rows
+};
 var fault_fired: std.atomic.Value(bool) = .init(false);
 
 fn faultSetting() ?struct { kind: Fault, at: usize } {
@@ -1345,8 +1345,7 @@ fn refused(err: anyerror) !void {
 fn broken(err: anyerror) bool {
     return switch (err) {
         error.CollectiveFailed, error.PeerLost, error.Timeout, error.Mismatch, error.Aborted, error.PeerDown, error.OutOfStep, error.FrameTooLong => true,
-        // a sticky device fault (illegal address, launch failure, ...): every later call on this GPU fails, so the
-        // rank exits and the launcher restarts the pair instead of refusing every request from here on
+        // a sticky device fault (illegal address, launch failure): every later call fails, so the pair restarts
         error.DeviceFault => true,
         else => false,
     };

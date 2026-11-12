@@ -1,8 +1,7 @@
 //! Images on rank 0 for the served lane's vision path: an image's bytes into its picture on the request's thread
 //! (lanes.stream.Vision.prepare: decoded, planned, padded and cut into the ViT's patches as the lane's `decode` makes
-//! them, picture.zig), and the picture into its span's rows on the lane host's thread at the prompt pass (the tower's
-//! encode and span rows, vit.zig on CUDA, vit_hip.zig on HIP), which lanes.zig then hands to the text model and to the
-//! other ranks.
+//! them, picture.zig), and the picture into its span's rows (CUDA: on the lane host's thread at the prompt pass; HIP:
+//! on encoder.zig's thread), by vit.zig or vit_hip.zig, which lanes.zig then hands to the text model and to the ranks.
 const std = @import("std");
 const gpu = @import("gpu");
 const lanes = @import("lanes");
@@ -34,9 +33,8 @@ pub const Vision = struct {
     pil: ?*pil.Pil = null, // the formats picture.zig does not decode (null: no python3 with Pillow here)
     own: ?gpu.Stream = null, // HIP: the tower's stream, apart from the model's (its encoder thread's)
 
-    /// The tower on `m`'s stream, its weights from `model_dir`'s index (the checkpoint, or on HIP the vision sidecar,
-    /// TF_DS_VISION_DIR) and its workspace for the largest picture. CUDA: its exact kernels and cuBLAS handle as the
-    /// tower gate ran them, torch's attention cubin from the kit's vision/. HIP: the AMD kit's vision.* kernels.
+    /// The tower (CUDA: on `m`'s stream, its gate's kernels and cuBLAS handle, torch's cubin from the kit's vision/;
+    /// HIP: the kit's vision.* kernels), weights from `model_dir`'s index, its workspace for the largest picture.
     pub fn open(gpa: std.mem.Allocator, io: std.Io, m: *model.Model, model_dir: []const u8, kit_dir: []const u8) !*Vision {
         if (hip) return openHip(gpa, io, m, model_dir);
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
