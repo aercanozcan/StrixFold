@@ -44,7 +44,7 @@ class ImageRoutes(unittest.TestCase):
         log_path = Path(cls.temp.name) / 'server.log'
         cls.log = log_path.open('w')
         cls.addClassCleanup(cls.log.close)
-        env = dict(os.environ, TF_FAKE_VISION='1', TF_FAKE_VISION_MAX='16', TF_FAKE_TOKENIZER=os.environ['TF_VISION_TEST_TOKENIZER'])
+        env = dict(os.environ, TF_FAKE_VISION='1', TF_FAKE_VISION_MAX='16', TF_FAKE_VISION_MAX_PIXELS=str(3 << 19), TF_FAKE_TOKENIZER=os.environ['TF_VISION_TEST_TOKENIZER'])
         server = os.environ.get('TF_VISION_TEST_SERVER', str(SRC / 'zig-out/server/fake_serve'))
         cls.process = subprocess.Popen([server, 'serve', str(SRC / 'zig/tests/server/fixtures'), '--host', '127.0.0.1',
                                         '--port', '0', '--name', 'dsv41'], env=env, stdout=cls.log, stderr=subprocess.STDOUT)
@@ -200,6 +200,35 @@ class ImageRoutes(unittest.TestCase):
         status, answer = self.post('/v1/chat/completions', body)
         self.assertEqual(status, 400, answer)  # 24: over it
         self.assertIn('image tokens', answer['error']['message'])
+
+    def test_images_over_the_engine_pixels_are_refused_with_400(self):
+        # fake_serve: "image-L" decodes to 2^20 pixels in 4 tokens; the cap here is 1.5 of them
+        body = self.chat(0)
+        body['messages'][0]['content'] = [{'type': 'text', 'text': 'Compare.'}, image_url('image-L'), image_url('image-A')]
+        for route in ('/v1/chat/completions', '/v1/tokenize'):
+            status, answer = self.post(route, body)
+            self.assertEqual(status, 200, answer)
+        body['messages'][0]['content'].append(image_url('image-L'))
+        for route in ('/v1/chat/completions', '/v1/tokenize'):
+            status, answer = self.post(route, body)
+            self.assertEqual(status, 400, answer)
+            self.assertIn('pixels by image 3 of 3', json.dumps(answer))
+
+    def test_no_picture_after_the_one_crossing_a_limit_is_prepared(self):
+        # fake_serve refuses "image-X" when it prepares it; placed after the crossing picture, it must never be reached
+        body = self.chat(0)
+        body['messages'][0]['content'] = [{'type': 'text', 'text': 'Compare.'}, image_url('image-X')]
+        status, answer = self.post('/v1/tokenize', body)
+        self.assertEqual(status, 400, answer)
+        self.assertIn('prepared image-X', json.dumps(answer))
+        for pictures, limit in ((['image-L', 'image-L', 'image-X'], 'pixels by image 2 of 3'),
+                                (['image-B'] * 3 + ['image-X'], 'image tokens by image 3 of 4')):
+            body['messages'][0]['content'] = [{'type': 'text', 'text': 'Compare.'}] + [image_url(p) for p in pictures]
+            for route in ('/v1/chat/completions', '/v1/tokenize'):
+                status, answer = self.post(route, body)
+                self.assertEqual(status, 400, (route, answer))
+                self.assertIn(limit, json.dumps(answer), route)
+                self.assertNotIn('image-X', json.dumps(answer), route)
 
 if __name__ == '__main__':
     unittest.main()

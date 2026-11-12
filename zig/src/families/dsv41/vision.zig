@@ -113,7 +113,7 @@ pub const Vision = struct {
 
     /// The server's view: the placeholder the template renders for each image and the picture it prepares.
     pub fn hook(v: *Vision) lanes.stream.Vision {
-        return .{ .ctx = v, .placeholder = placeholder, .token = v.m.cfg.image_token.?, .prepare = prepareFn };
+        return .{ .ctx = v, .placeholder = placeholder, .token = v.m.cfg.image_token.?, .prepare = prepareFn, .max_pixels = picture.max_pixels };
     }
 
     pub const placeholder = "<\u{ff5c}deepseek_image\u{ff5c}>";
@@ -168,7 +168,7 @@ fn prepared(p: ?*pil.Pil, cfg: picture.Config, a: std.mem.Allocator, bytes: []co
     @memset(payload[0..header_bytes], 0);
     for ([_]usize{ g.best_h, g.best_w, g.n_vit_h, g.n_vit_w, g.n_llm_h, g.n_llm_w }, 0..) |x, i| std.mem.writeInt(u32, payload[i * 4 ..][0..4], @intCast(x), .little);
     @memcpy(payload[header_bytes..], std.mem.sliceAsBytes(pic.patches));
-    return .{ .tokens = @intCast(g.spanTokens()), .payload = payload };
+    return .{ .tokens = @intCast(g.spanTokens()), .payload = payload, .pixels = @as(u64, rgb.w) * rgb.h };
 }
 
 /// The image's RGB as the lane's Pillow decodes it: picture.zig's PNG, else Pillow's own (the refusal in the lane's
@@ -222,6 +222,7 @@ test "a prepared picture leaves only its payload in the request's allocator, and
     const n_vit_w = std.mem.readInt(u32, prep.payload[12..16], .little);
     try std.testing.expectEqual(header_bytes + @as(usize, n_vit_h) * n_vit_w * 14 * 14 * 3 * 2, prep.payload.len);
     try std.testing.expectEqual(@as(u32, 13 * 14 + 2), prep.tokens);
+    try std.testing.expectEqual(@as(u64, 1), prep.pixels);
     var fb = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
     try std.testing.expectError(error.BadImage, prepared(null, .{}, fb.allocator(), "GIF89a", &problem));
     defer fb.allocator().free(problem);
