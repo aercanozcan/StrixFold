@@ -35,6 +35,8 @@ pub const Config = struct {
     /// The served name first, then aliases, without repeats.
     model_ids: []const []const u8,
     default_max_tokens: i64 = 4096,
+    /// Image parts a request may carry, its earlier turns' included (--vision-max-images), counted before decoding.
+    max_images: u32 = 32,
     enable_thinking: bool = true,
     reasoning_effort: ?[]const u8 = null,
     thinking_budget: i64 = 0,

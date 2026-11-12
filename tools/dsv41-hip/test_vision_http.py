@@ -47,7 +47,7 @@ class ImageRoutes(unittest.TestCase):
         env = dict(os.environ, TF_FAKE_VISION='1', TF_FAKE_VISION_MAX='16', TF_FAKE_VISION_MAX_PIXELS=str(3 << 19), TF_FAKE_TOKENIZER=os.environ['TF_VISION_TEST_TOKENIZER'])
         server = os.environ.get('TF_VISION_TEST_SERVER', str(SRC / 'zig-out/server/fake_serve'))
         cls.process = subprocess.Popen([server, 'serve', str(SRC / 'zig/tests/server/fixtures'), '--host', '127.0.0.1',
-                                        '--port', '0', '--name', 'dsv41'], env=env, stdout=cls.log, stderr=subprocess.STDOUT)
+                                        '--port', '0', '--name', 'dsv41', '--vision-max-images', '4'], env=env, stdout=cls.log, stderr=subprocess.STDOUT)
         cls.addClassCleanup(cls.close_server)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
@@ -200,6 +200,33 @@ class ImageRoutes(unittest.TestCase):
         status, answer = self.post('/v1/chat/completions', body)
         self.assertEqual(status, 400, answer)  # 24: over it
         self.assertIn('image tokens', answer['error']['message'])
+
+    def image_route_bodies(self, count, url):
+        # every route that takes images, each with `count` image parts of `url`
+        text = {'type': 'text', 'text': 'What is shown?'}
+        chat = self.chat(0)
+        chat['messages'][0]['content'] = [text] + [{'type': 'image_url', 'image_url': {'url': url}}] * count
+        completions = {k: v for k, v in chat.items() if k != 'model'}
+        block = {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': url.split(',', 1)[1]}}
+        anthropic = {'model': 'dsv41', 'max_tokens': 16, 'temperature': 0, 'thinking': {'type': 'disabled'},
+                     'messages': [{'role': 'user', 'content': [text] + [block] * count}]}
+        responses = {'model': 'dsv41', 'max_output_tokens': 16, 'temperature': 0,
+                     'input': [{'role': 'user', 'content': [{'type': 'input_text', 'text': 'What is shown?'}] +
+                                [{'type': 'input_image', 'image_url': url}] * count}]}
+        return [('/v1/chat/completions', chat), ('/v1/completions', dict(completions, model='dsv41')),
+                ('/v1/messages', anthropic), ('/v1/messages/count_tokens', anthropic), ('/v1/responses', responses),
+                ('/v1/tokenize', chat)]
+
+    def test_images_past_the_count_limit_are_refused_before_decoding_on_every_route(self):
+        # the server runs with --vision-max-images 4; five parts whose base64 is cut short get the count's refusal
+        for route, body in self.image_route_bodies(4, PNG):
+            status, answer = self.post(route, body)
+            self.assertEqual(status, 200, (route, answer))
+        for route, body in self.image_route_bodies(5, 'data:image/png;base64,aGVsbG8hZ'):
+            status, answer = self.post(route, body)
+            self.assertEqual(status, 400, (route, answer))
+            self.assertIn('5 images', json.dumps(answer), route)
+            self.assertIn('--vision-max-images', json.dumps(answer), route)
 
     def test_images_over_the_engine_pixels_are_refused_with_400(self):
         # fake_serve: "image-L" decodes to 2^20 pixels in 4 tokens; the cap here is 1.5 of them

@@ -105,6 +105,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .served_name = s.served,
         .model_ids = ids.items,
         .default_max_tokens = args.max_tokens,
+        .max_images = args.vision_max_images,
         .enable_thinking = args.thinking,
         .reasoning_effort = args.reasoning_effort,
         .thinking_budget = args.thinking_budget,

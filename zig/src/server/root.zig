@@ -39,6 +39,7 @@ test {
     _ = @import("stream_preflight_test.zig");
     _ = @import("structure_test.zig");
     _ = @import("top_k_test.zig");
+    _ = @import("image_limits_test.zig");
     _ = @import("late_system_test.zig");
     _ = @import("effort_values_test.zig");
     _ = @import("telemetry_reply_test.zig");

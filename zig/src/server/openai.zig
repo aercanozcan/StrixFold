@@ -122,7 +122,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
     var input: chat.Input = .{ .fields = undefined };
     // an engine with vision takes image parts: their placeholders in the text, their bytes in input.images
-    var images: messages.Images = .{ .placeholder = if (srv.info.vision) |v| v.placeholder else "" };
+    var images: messages.Images = .{ .placeholder = if (srv.info.vision) |v| v.placeholder else "", .max = srv.config.max_images };
     const take: ?*messages.Images = if (srv.info.vision != null) &images else null;
     if (is_chat) {
         input.messages = try messages.normalizeImages(cx, body.get("messages"), "system", srv.needs_user_after_tool, srv.dialect, take);
