@@ -478,9 +478,9 @@ pub const Model = struct {
             // HIP: both ranks need it (rank 1 has no tower whose open would refuse its absence; a rank without it would
             // refuse the image spans its peer routes), so a text_image rank without the file does not start
             m.loadVisionBias(path) catch |err| if (gpu.backend == .hip or o.vision_bias != null or err != error.FileNotFound) return if (err == error.FileNotFound) error.NoVisionKit else err;
-            // HIP: a request's image rows (image_rows_reserved of them; more grow it) on the device from the start, so a
-            // prompt with images allocates nothing on either rank (a rank-1-only allocation failure would leave the
-            // ranks with different spans)
+            // HIP: a request's image rows (image_rows_reserved of them, the most it may have) on the device from the
+            // start, so a prompt with images allocates nothing on either rank (a rank-1-only allocation failure would
+            // leave the ranks with different spans)
             if (gpu.backend == .hip) m.img_buf = try gpu.DeviceBuffer.alloc(m.ctx.d, image_rows_reserved * c.hidden * 2);
         }
 
@@ -739,12 +739,15 @@ pub const Model = struct {
 
     /// The image rows a text_image rank keeps on the device from its open (four pictures of a whole span).
     pub const image_rows_reserved = 4096;
+    /// A request's image rows at most (HIP: what its open reserved; CUDA grows its buffer instead).
+    pub const image_rows_cap: ?usize = if (gpu.backend == .hip) image_rows_reserved else null;
 
     /// The filling prompt's image spans (absolute positions, in order) and their rows bf16 [tokens, hidden] from the
     /// host, after fillBegin and before its chunks.
     pub fn setImages(m: *Model, spans: []const prompt.Span, rows: []const u8) !void {
         if (rows.len > 0) {
             if (m.img_buf == null or m.img_buf.?.len < rows.len) {
+                if (image_rows_cap != null) return error.TooManyImageRows; // HIP never reallocates (both ranks alike)
                 if (m.img_buf) |*b| b.free();
                 m.img_buf = null;
                 m.img_buf = try gpu.DeviceBuffer.alloc(m.ctx.d, rows.len);

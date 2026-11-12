@@ -38,6 +38,28 @@ pub const window_rows = 6;
 /// The image rows a fill_images frame carries at most.
 pub const image_piece = 32 << 10;
 
+/// A request's image span rows, all its pictures together.
+pub fn spanRows(images: []const lanes.stream.Image) usize {
+    var n: usize = 0;
+    for (images) |img| n += img.tokens;
+    return n;
+}
+
+/// Whether a request's image rows fit what both ranks reserved (model.Model.image_rows_cap; none: any).
+pub fn imageRowsFit(rows: usize) bool {
+    const cap = model.Model.image_rows_cap orelse return true;
+    return rows <= cap;
+}
+
+test "a request's image rows are capped at the rows both HIP ranks reserved" {
+    const Image = lanes.stream.Image;
+    const two = [_]Image{ .{ .at = 0, .tokens = 2048, .bytes = "" }, .{ .at = 4096, .tokens = 2048, .bytes = "" } };
+    const over = [_]Image{ .{ .at = 0, .tokens = 2048, .bytes = "" }, .{ .at = 4096, .tokens = 2049, .bytes = "" } };
+    try std.testing.expectEqual(@as(usize, 4096), spanRows(&two));
+    try std.testing.expect(imageRowsFit(spanRows(&two)) and imageRowsFit(0));
+    try std.testing.expectEqual(gpu.backend != .hip, imageRowsFit(spanRows(&over)));
+}
+
 /// A gate's diagnostic (the tools' --logits-sha 1): each prompt's logits' sha256 and rows on stderr.
 pub var logits_sha = false;
 /// The most prompt plus max_tokens tokens a request may hold in a pool of `pool` positions: a stream's extent is the
@@ -599,6 +621,7 @@ pub const Lanes = struct {
         const len = ids.len;
         if (len == 0) return error.EmptyPrompt;
         if (len + s.max_new > usableContext(m.pool_cap, m.eng.round_rows)) return error.PromptTooLong;
+        if (!imageRowsFit(spanRows(s.images))) return error.TooManyImageRows;
         const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
         if (self.streams.fetchRemove(s)) |old| {
             self.used[old.value.slot] = false;
@@ -1457,13 +1480,12 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const off: usize = @intCast(try r.int(u64));
                 const piece = r.rest();
                 try r.end();
+                if (!imageRowsFit(row)) return error.BadFrame; // rank 0 refuses such a request before any frame
                 const total = row * m.cfg.hidden * 2;
                 if (off != img_rows.items.len or off + piece.len > total or piece.len == 0) return error.BadFrame;
                 try img_rows.appendSlice(gpa, piece);
                 if (img_rows.items.len == total) {
-                    // rank 0 set the same rows before it sent them all, so a refusal here is this rank's alone: going
-                    // on would prefill the spans' tokens without their rows while rank 0 has them. The follower ends
-                    // instead (rank 0 sees the link close and exits; the launcher restarts the pair).
+                    // rank 0 sets these rows after sending them; refusing here would split the ranks: the follower ends
                     const set = if (testFault(.set_images)) error.InjectedFault else m.setImages(spans.items, img_rows.items);
                     set catch |err| {
                         std.log.err("lanes: rank 1 could not take the prompt's image rows ({s}); the follower ends", .{@errorName(err)});

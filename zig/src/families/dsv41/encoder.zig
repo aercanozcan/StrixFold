@@ -5,7 +5,7 @@ const Allocator = std.mem.Allocator;
 const Image = lanes.stream.Image;
 const Wake = lanes.stream.Wake;
 
-/// The tower the thread drives: `bind` once on that thread, `rows` appends a picture's span rows and returns its tokens.
+/// The tower the thread drives: `bind` once on that thread, `rows` appends a picture's span rows, returns its tokens.
 pub const Tower = struct {
     ctx: *anyopaque,
     bind: *const fn (ctx: *anyopaque) anyerror!void,
@@ -28,14 +28,15 @@ pub const Encoder = struct {
     gpa: Allocator,
     io: std.Io,
     tower: Tower,
+    cap: usize, // a request's image rows at most (Model.image_rows_reserved): more fail at once, nothing encoded
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
     jobs: std.ArrayList(*Job) = .empty,
     closing: bool = false,
     thread: ?std.Thread = null,
 
-    pub fn init(gpa: Allocator, io: std.Io, tower: Tower) Encoder {
-        return .{ .gpa = gpa, .io = io, .tower = tower };
+    pub fn init(gpa: Allocator, io: std.Io, tower: Tower, cap: usize) Encoder {
+        return .{ .gpa = gpa, .io = io, .tower = tower, .cap = cap };
     }
 
     pub fn start(e: *Encoder) !void {
@@ -92,7 +93,12 @@ pub const Encoder = struct {
         for (j.payloads) |*p| p.* = &.{};
         j.tokens = try e.gpa.alloc(usize, images.len);
         j.ends = try e.gpa.alloc(usize, images.len);
-        for (images, j.payloads) |img, *p| if (!img.rows) {
+        var rows: usize = 0;
+        for (images) |img| rows += img.tokens;
+        if (rows > e.cap) {
+            j.state = .done;
+            j.err = error.TooManyImageRows;
+        } else for (images, j.payloads) |img, *p| if (!img.rows) {
             p.* = try e.gpa.alignedAlloc(u8, .@"16", img.bytes.len);
             @memcpy(p.*, img.bytes);
         };
@@ -246,7 +252,7 @@ fn waitReady(e: *Encoder, images: []const Image) void {
 test "an encoder hands each request its pictures' rows in order, the rows that came ready skipped" {
     const gpa = std.testing.allocator;
     var fake: Fake = .{};
-    var e = Encoder.init(gpa, std.testing.io, fake.tower());
+    var e = Encoder.init(gpa, std.testing.io, fake.tower(), 8);
     try e.start();
     defer e.stop();
     var woken: Woken = .{};
@@ -269,7 +275,7 @@ test "a request forgotten while its picture encodes is freed by the thread, unwo
     const gpa = std.testing.allocator;
     var fake: Fake = .{};
     fake.hold.store(true, .release);
-    var e = Encoder.init(gpa, std.testing.io, fake.tower());
+    var e = Encoder.init(gpa, std.testing.io, fake.tower(), 8);
     try e.start();
     defer e.stop();
     var woken: Woken = .{};
@@ -302,7 +308,7 @@ test "a request forgotten while its picture encodes is freed by the thread, unwo
 test "a failed encode is the request's error at its prompt pass" {
     const gpa = std.testing.allocator;
     var fake: Fake = .{ .fail = true };
-    var e = Encoder.init(gpa, std.testing.io, fake.tower());
+    var e = Encoder.init(gpa, std.testing.io, fake.tower(), 8);
     try e.start();
     defer e.stop();
     var woken: Woken = .{};
@@ -313,4 +319,21 @@ test "a failed encode is the request's error at its prompt pass" {
     defer out.deinit(gpa);
     try std.testing.expectError(error.DeviceFault, e.take(&a, 0, gpa, &out));
     e.forget(&a);
+}
+
+test "a request over the image row cap fails at once, its pictures never encoded" {
+    const gpa = std.testing.allocator;
+    var fake: Fake = .{};
+    var e = Encoder.init(gpa, std.testing.io, fake.tower(), 4);
+    try e.start();
+    defer e.stop();
+    var woken: Woken = .{};
+    const a = [_]Image{ .{ .at = 0, .tokens = 3, .bytes = &.{ 3, 1 } }, .{ .at = 4, .tokens = 2, .bytes = &.{ 2, 1 } } };
+    try e.submit(&a, woken.wake());
+    try std.testing.expect(e.ready(&a));
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try std.testing.expectError(error.TooManyImageRows, e.take(&a, 0, gpa, &out));
+    e.forget(&a);
+    try std.testing.expectEqual(@as(u32, 0), fake.encodes.load(.acquire));
 }

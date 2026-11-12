@@ -212,7 +212,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
     st.encoder = null;
     if (gpu.features.vision and gpu.backend == .hip) if (st.vision) |v| {
         const enc = try gpa.create(encoder_mod.Encoder);
-        enc.* = .init(gpa, io, v.encoderTower());
+        enc.* = .init(gpa, io, v.encoderTower(), model.Model.image_rows_reserved);
         enc.start() catch |err| {
             gpa.destroy(enc);
             return err;
@@ -268,6 +268,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NoVisionKernels => "text_image on HIP needs the AMD kit's vision.* kernels (vision.hip): a kit built before them",
         error.NoVisionWeights => "text_image on HIP needs the vision tower's weights: TF_DS_VISION_DIR (a sidecar made by tools/dsv41-zig/kit/make_vision_sidecar.py) with model.safetensors.index.json",
         error.MissingVisionTensor, error.BadVisionTensor => "the vision weights (TF_DS_VISION_DIR) lack a tower tensor or hold one of another dtype or shape",
+        error.TooManyImageRows => std.fmt.comptimePrint("a request's images take at most {d} image tokens on this engine (four pictures at the largest size): send fewer or smaller images", .{model.Model.image_rows_reserved}),
         error.VisionUnsupported => "image input is not implemented on this backend: serve text only (TF_DS_MODALITIES=text)",
         error.BadModalities => "TF_DS_MODALITIES: text or text_image",
         error.NoCollective => "this build has no collectives transport for the ranks yet (HIP: w-link's TCP transport, model.Options.open_coll)",

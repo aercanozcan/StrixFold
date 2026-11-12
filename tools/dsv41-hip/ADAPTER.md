@@ -397,7 +397,9 @@ tower on rank 0. Everything above about `text` still holds: a text rank opens, l
   (`VISION_DIR`'s SHA256SUMS, `VISION_BIAS_SHA256`) before a text_image start.
 - **Memory:** rank 0 holds the weights (926 MiB) and a workspace for the largest picture (1021 cells, 9189 patches:
   324 MiB), a 10 MiB span buffer, and both ranks 4096 image rows (40 MiB) from the open, so an image request allocates
-  nothing on the device.
+  nothing on the device. Those rows are a request's cap: rank 0 refuses a request whose pictures' spans add up to more
+  (`TooManyImageRows`, before its encode), `setImages` never reallocates on HIP, and rank 1 rejects a `fill_images`
+  frame past the cap as a bad frame.
 - **Pair:** rank 0 runs the tower before `fill_begin` and sends the span rows (`fill_images`, 32 KiB pieces); rank 1
   never runs it. A tower or decode error refuses the request before any frame; a rank-0 error between pieces leaves
   rank 1's partial rows to the next `fill_begin`; rank 1 failing to take the complete rows ends the follower (the pair
