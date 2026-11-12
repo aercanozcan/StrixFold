@@ -116,9 +116,23 @@ pub const Vision = struct {
     token: u32,
     prepare: *const fn (ctx: *anyopaque, a: Allocator, bytes: []const u8, problem: *[]const u8) PrepareError!Prepared,
 
+    /// A tower that encodes off the engine thread (HIP's); null: the prompt pass runs it.
+    encode: ?Encode = null,
+
     pub const Prepared = struct { tokens: u32, payload: []const u8 };
     pub const PrepareError = error{ BadImage, OutOfMemory };
 };
+
+/// Off-thread encodes: `start` at submit, `ready` before admission (false: it waits), `forget` once the rows are taken.
+pub const Encode = struct {
+    ctx: *anyopaque,
+    start: *const fn (ctx: *anyopaque, images: []const Image, wake: Wake) void,
+    ready: *const fn (ctx: *anyopaque, images: []const Image) bool,
+    forget: *const fn (ctx: *anyopaque, images: []const Image) void,
+};
+
+/// Called on the encoder's thread once a request's rows are ready, with none of its own locks held.
+pub const Wake = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque) void };
 
 pub const Spec = struct {
     id: []const u8,

@@ -90,7 +90,7 @@ pub fn launch(f: Function, cfg: Config, stream: Stream, args: *Args) Error!void 
     try cfg.validate();
     if (!cfg.plain()) return error.Unsupported;
     if (before) |hook| try hook(f, cfg, args);
-    count += 1;
+    _ = @atomicRmw(u64, &count, .Add, 1, .monotonic); // rank 0's encoder thread launches too
     const g = cfg.grid;
     const b = cfg.block;
     try f.d.check(f.d.api.hipModuleLaunchKernel(f.handle, g.x, g.y, g.z, b.x, b.y, b.z, cfg.shared, stream.handle, args.pointers(), null), "hipModuleLaunchKernel");

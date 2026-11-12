@@ -24,6 +24,7 @@ const gpu = @import("gpu");
 /// The vision tower's type (gpu.features.vision: CUDA's vit.zig, HIP's vit_hip.zig behind vision.zig); an empty type
 /// in a build without one.
 pub const VisionTower = if (gpu.features.vision) @import("vision.zig").Vision else opaque {};
+const Encoder = @import("encoder.zig").Encoder;
 
 const be = lanes.backend;
 const grammar = lanes.grammar;
@@ -460,6 +461,7 @@ pub const Lanes = struct {
     m: *Model,
     peer: ?link.Link, // rank 1 (null: one rank); every follower gets each frame (Model.followers)
     vision: ?*VisionTower = null, // rank 0's tower (a vision checkpoint served with its kit's vision/; CUDA builds only)
+    encoder: ?*Encoder = null, // HIP: that tower on its own thread; the prompt pass takes its rows
     step: u64 = 0,
     wire: Wire = .{},
     streams: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
@@ -687,7 +689,7 @@ pub const Lanes = struct {
             const image_id = m.cfg.image_token orelse return error.NoVision;
             const row_bytes = m.cfg.hidden * 2;
             var at_row: usize = 0;
-            for (s.images) |img| {
+            for (s.images, 0..) |img, k| {
                 if (img.tokens == 0 or @as(usize, img.at) + img.tokens > len) return error.BadImageSpan;
                 for (seq.items[img.at..][0..img.tokens]) |*q| {
                     if (q.* != @as(i64, image_id)) return error.BadImageSpan;
@@ -697,11 +699,12 @@ pub const Lanes = struct {
                     if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
                     try rows.appendSlice(gpa, img.bytes);
                 } else {
-                    // a prepared picture (vision.zig): the tower's span rows, here on rank 0
+                    // a prepared picture (vision.zig): the tower's span rows on rank 0 (HIP: from its encoder thread)
                     if (!gpu.features.vision) return error.NoVisionTower;
                     const v = self.vision orelse return error.NoVisionTower;
                     if (testFault(.tower)) return error.InjectedFault;
-                    if (try v.rows(img.bytes, gpa, &rows) != img.tokens) return error.BadImageSpan;
+                    const t = if (self.encoder) |enc| try enc.take(s.images, k, gpa, &rows) else try v.rows(img.bytes, gpa, &rows);
+                    if (t != img.tokens) return error.BadImageSpan;
                 }
                 try spans.append(gpa, .{ .at = img.at, .len = img.tokens, .row = at_row });
                 at_row += img.tokens;

@@ -42,6 +42,7 @@ const draft_mod = @import("draft.zig");
 const link = @import("link.zig");
 const rank_cache = @import("rank_cache.zig");
 const sampling = @import("sampling.zig");
+const encoder_mod = @import("encoder.zig");
 /// The vision tower (gpu.features.vision): CUDA's and HIP's behind vision.zig.
 const vision_mod = if (gpu.features.vision) @import("vision.zig") else struct {
     pub const Vision = lanes_mod.VisionTower;
@@ -110,6 +111,7 @@ const State = struct {
     m: *model.Model,
     lanes: lanes_mod.Lanes,
     vision: ?*vision_mod.Vision = null,
+    encoder: ?*encoder_mod.Encoder = null, // HIP: the tower's own thread
     vocab: ?*lanes.grammar.Vocab = null,
 };
 
@@ -207,14 +209,36 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
     }
     errdefer if (gpu.features.vision) if (st.vision) |v| v.close();
     st.lanes.vision = st.vision;
+    st.encoder = null;
+    if (gpu.features.vision and gpu.backend == .hip) if (st.vision) |v| {
+        const enc = try gpa.create(encoder_mod.Encoder);
+        enc.* = .init(gpa, io, v.encoderTower());
+        enc.start() catch |err| {
+            gpa.destroy(enc);
+            return err;
+        };
+        st.encoder = enc;
+    };
+    errdefer if (st.encoder) |enc| stopEncoder(gpa, enc);
+    st.lanes.encoder = st.encoder;
+    var hook: ?lanes.stream.Vision = if (gpu.features.vision) (if (st.vision) |v| v.hook() else null) else null;
+    if (hook) |*x| if (st.encoder) |enc| {
+        x.encode = enc.hook();
+    };
     // the pool is the model's (preallocated): a stream takes no device memory of its own
     const L = lanes_mod.Lanes;
     const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn };
-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (gpu.features.vision) (if (st.vision) |v| v.hook() else null) else null, .structures = st.vocab != null, .context_window = lanes_mod.usableContext(st.m.pool_cap, st.m.eng.round_rows) };
+    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = hook, .structures = st.vocab != null, .context_window = lanes_mod.usableContext(st.m.pool_cap, st.m.eng.round_rows) };
+}
+
+fn stopEncoder(gpa: std.mem.Allocator, enc: *encoder_mod.Encoder) void {
+    enc.stop();
+    gpa.destroy(enc);
 }
 
 fn deinitFn(ptr: *anyopaque) void {
     const st: *State = @ptrCast(@alignCast(ptr));
+    if (st.encoder) |enc| stopEncoder(st.gpa, enc); // before the tower it drives
     st.lanes.deinit(); // rank 1 hears done
     if (st.vocab) |v| v.deinit(st.gpa);
     if (gpu.features.vision) if (st.vision) |v| v.close();

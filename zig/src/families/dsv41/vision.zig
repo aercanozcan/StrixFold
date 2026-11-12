@@ -14,6 +14,7 @@ const fmha = if (hip) struct {} else @import("fmha.zig");
 const hip_load = if (hip) @import("hip_load.zig") else struct {};
 const model = @import("model.zig");
 const pil = @import("pil.zig");
+const encoder = @import("encoder.zig");
 
 /// A prepared image's payload: its grid (six u32, little-endian: best_h, best_w, n_vit_h, n_vit_w, n_llm_h, n_llm_w)
 /// then its patches (bf16, picture.patchify's order), the patches 16-byte aligned.
@@ -31,6 +32,7 @@ pub const Vision = struct {
     span: gpu.DeviceBuffer, // bf16 [max_span, 5120]: a picture's span rows
     scratch: gpu.DeviceBuffer, // the span's types and rows (Tower.spanRows)
     pil: ?*pil.Pil = null, // the formats picture.zig does not decode (null: no python3 with Pillow here)
+    own: ?gpu.Stream = null, // HIP: the tower's stream, apart from the model's (its encoder thread's)
 
     /// The tower on `m`'s stream, its weights from `model_dir`'s index (the checkpoint, or on HIP the vision sidecar,
     /// TF_DS_VISION_DIR) and its workspace for the largest picture. CUDA: its exact kernels and cuBLAS handle as the
@@ -68,7 +70,9 @@ pub const Vision = struct {
         v.* = .{ .gpa = gpa, .m = m, .tower = undefined, .span = undefined, .scratch = undefined };
         v.kernels = (try hip_load.vision(m.kit)) orelse return error.NoVisionKernels;
         const d = m.ctx.d;
-        v.tower = try vit.Tower.open(gpa, io, d, m.stream, weights_dir, &v.kernels);
+        v.own = try gpu.Stream.init(d, true);
+        errdefer v.own.?.deinit();
+        v.tower = try vit.Tower.open(gpa, io, d, v.own.?, weights_dir, &v.kernels);
         errdefer v.tower.close();
         const cells = vit.maxCells(v.cfg.max_tokens);
         try v.tower.reserve(cells * v.cfg.ratio * v.cfg.ratio, cells);
@@ -90,7 +94,23 @@ pub const Vision = struct {
         v.scratch.free();
         v.span.free();
         v.tower.close();
+        if (v.own) |*s| s.deinit();
         v.gpa.destroy(v);
+    }
+
+    /// HIP: the tower as its encoder thread drives it (the device made current there; `rows` on the tower's stream).
+    pub fn encoderTower(v: *Vision) encoder.Tower {
+        const T = struct {
+            fn bind(ctx: *anyopaque) anyerror!void {
+                const x: *Vision = @ptrCast(@alignCast(ctx));
+                try x.m.ctx.makeCurrent();
+            }
+            fn rows(ctx: *anyopaque, payload: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) anyerror!usize {
+                const x: *Vision = @ptrCast(@alignCast(ctx));
+                return x.rows(payload, gpa, out);
+            }
+        };
+        return .{ .ctx = v, .bind = T.bind, .rows = T.rows };
     }
 
     /// The server's view: the placeholder the template renders for each image and the picture it prepares.
@@ -148,8 +168,8 @@ pub const Vision = struct {
         }
     }
 
-    /// A prepared picture's span rows bf16 [tokens, 5120] appended to `out` (the tower on the model's stream, then the
-    /// rows to the host); its span's tokens.
+    /// A prepared picture's span rows bf16 [tokens, 5120] appended to `out` (the tower on its stream, then the rows to
+    /// the host); its span's tokens.
     pub fn rows(v: *Vision, payload: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !usize {
         if (payload.len < header_bytes) return error.BadImagePayload;
         var x: [6]usize = undefined;

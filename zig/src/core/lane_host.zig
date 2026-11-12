@@ -140,8 +140,10 @@ pub const LaneHost = struct {
         const h = self(ctx);
         const job = h.gpa.create(Job) catch return error.Busy;
         job.* = .{ .host = h, .id = id, .request = request, .sink = sink };
+        if (h.encoder(request)) |x| x.start(x.ctx, request.images, .{ .ctx = h, .call = woken });
         h.mutex.lockUncancelable(h.io);
         defer h.mutex.unlock(h.io);
+        errdefer if (h.encoder(request)) |x| x.forget(x.ctx, request.images);
         if (h.closing) {
             h.gpa.destroy(job);
             return error.Closed;
@@ -156,6 +158,29 @@ pub const LaneHost = struct {
             return error.Busy;
         };
         h.wake.signal(h.io);
+    }
+
+    /// The family's off-thread tower for a request with images; null: its prompt pass runs any tower itself.
+    fn encoder(h: *const LaneHost, r: *const Request) ?lanes.stream.Encode {
+        if (r.images.len == 0) return null;
+        const v = h.info_.vision orelse return null;
+        return v.encode;
+    }
+
+    fn woken(ctx: *anyopaque) void {
+        const h = self(ctx);
+        h.lock();
+        defer h.unlock();
+        h.wake.signal(h.io);
+    }
+
+    /// The first queued job its backend can take now (the lock held): an image job waits for its encode, others pass.
+    fn firstReady(h: *LaneHost) ?usize {
+        for (h.queued.items, 0..) |job, i| {
+            const x = h.encoder(job.request) orelse return i;
+            if (x.ready(x.ctx, job.request.images)) return i;
+        }
+        return null;
     }
 
     fn cancelFn(ctx: *anyopaque, id: Id) void {
@@ -231,6 +256,7 @@ pub const LaneHost = struct {
 
     fn finish(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) void {
         job.reported();
+        if (h.encoder(job.request)) |x| x.forget(x.ctx, job.request.images);
         h.gpa.free(job.marks);
         const s = &job.stream;
         const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null, .telemetry_json = s.telemetry_buf[0..s.telemetry_len] } else .{};
@@ -314,7 +340,10 @@ pub const LaneHost = struct {
             }
             h.finish_until = null;
         }
-        const job = h.queued.orderedRemove(0);
+        const job = h.queued.orderedRemove(h.firstReady() orelse {
+            h.unlock();
+            return false;
+        });
         h.admitted.append(h.gpa, job) catch {
             h.unlock();
             h.finish(job, .failed, "out of memory");
@@ -387,6 +416,7 @@ pub const LaneHost = struct {
         job.prefilled = done;
         h.unlock();
         job.reported();
+        if (h.encoder(job.request)) |x| x.forget(x.ctx, job.request.images); // its prompt pass took the rows
         if (h.cache) |store| store.report(job.request.prompt.len, job.stream.cached, store.counts.kept - job.kept0);
         emit(job, .{ .prefilled = job.stream.cached });
     }
@@ -525,7 +555,7 @@ pub const LaneHost = struct {
                 continue;
             }
             if (h.core.activeCount() == 0) {
-                if (h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
+                if (h.cancels.items.len == 0 and (h.firstReady() == null or h.admitted.items.len >= h.info_.lanes))
                     h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
                 h.unlock();
                 continue;

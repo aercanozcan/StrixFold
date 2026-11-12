@@ -403,8 +403,13 @@ tower on rank 0. Everything above about `text` still holds: a text rank opens, l
   rank 1's partial rows to the next `fill_begin`; rank 1 failing to take the complete rows ends the follower (the pair
   restarts) instead of diverging; a sticky device fault (`DeviceFault`) is a broken pair. `TF_DS_TEST_FAULT`
   (`tower`, `fill_images:K`, `set_images`; once a process) injects each for the recovery tests.
+- **Encoder thread:** rank 0's tower runs on a thread and HIP stream of its own (`encoder.zig`), never on the engine
+  thread. The lane host hands a request's pictures to it at submit (payloads copied) and admits that request only once
+  its rows are ready; queued requests without images go first meanwhile, in their order, and other streams keep
+  decoding. The prompt pass then takes the ready rows (it never runs the tower). A cancelled request's job is dropped
+  (one being encoded is freed when its picture is done); a failed encode is that request's error at its prompt pass.
 - **Behaviour:** an image prompt skips the RAM prompt cache and the reuse hook (its tokens are
-  placeholders); a 1920x1080 picture encodes in about 2.9 s on gfx1151, during which other streams' rounds wait.
+  placeholders); a 1920x1080 picture encodes in about 2.9 s on gfx1151 (measured with the tower on the engine thread).
   PNG decodes in Zig; other formats need Python 3 with Pillow (the runtime image's `rocm10.0-vision` tag).
 
 ## 9. Build
