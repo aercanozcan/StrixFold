@@ -377,7 +377,8 @@ tower on rank 0. Everything above about `text` still holds: a text rank opens, l
 
 - **Tower:** `vit_hip.zig` (vit.zig's `Tower` surface: open, reserve, encode with probes, spanRows) on the AMD kit's
   `vision.*` kernels (`zig/kernels/hip/dsv41/vision.hip`: linear, rms_norm, attention, rope, add, silu_mul, gelu,
-  unfold, span), bound by `hip_load.vision` as an optional group. vision.zig picks the backend's tower at compile time;
+  unfold, span), bound by `hip_load.vision` as an optional group. Only rank 0 of a text_image pair reads, loads or
+  requires the kit's vision object (`Kit.open`'s `vision` feature); a text rank and rank 1 skip it. vision.zig picks the backend's tower at compile time;
   picture.zig, pil.zig, the payload and the server hook are shared with CUDA.
 - **Numerical identity:** engineLab's declared arithmetic (its HIP tower, `pr/ds41-vision` 481141258, adapted, arithmetic
   unchanged), not torch's kernels: every linear one FP32 fma chain over k ascending per output (bf16 after the bias),

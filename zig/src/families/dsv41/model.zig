@@ -281,7 +281,7 @@ pub const Model = struct {
         // there for the peers' handshake
         if (gpu.backend == .hip) {
             const caps = try ctx.caps();
-            m.kit = try gpu.Kit.open(gpa, io, d, o.hip_kit orelse try std.fs.path.join(a, &.{ o.kit_dir, "hip" }), caps.archName(), .{ .drafts = o.drafts, .engram = c.engram_layers.slice().len > 0, .graphs = o.graphs });
+            m.kit = try gpu.Kit.open(gpa, io, d, o.hip_kit orelse try std.fs.path.join(a, &.{ o.kit_dir, "hip" }), caps.archName(), .{ .drafts = o.drafts, .engram = c.engram_layers.slice().len > 0, .graphs = o.graphs, .vision = o.modalities == .text_image and o.rank == 0 });
             m.aux_which = try tri_aux.Which.fromEnv();
         }
         errdefer if (gpu.backend == .hip) m.kit.deinit();
