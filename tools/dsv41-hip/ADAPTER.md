@@ -414,6 +414,19 @@ tower on rank 0. Everything above about `text` still holds: a text rank opens, l
   its rows are ready; queued requests without images go first meanwhile, in their order, and other streams keep
   decoding. The prompt pass then takes the ready rows (it never runs the tower). A cancelled request's job is dropped
   (one being encoded is freed when its picture is done); a failed encode is that request's error at its prompt pass.
+- **A request's limits** (each refusal a 400 `invalid_request_error`, before the request queues):
+  - **Count:** at most `--vision-max-images` image parts (32 unless set; serve.conf `MAX_IMAGES`), every message's
+    included (earlier turns, tool results). They are counted before any part's base64 is read, on every image route
+    (chat, completions with messages, `/v1/messages` and its count_tokens, `/v1/responses`, `/v1/tokenize`).
+  - **Pixels:** at most 134,217,728 decoded pixels in all, the same as one picture may have (picture.zig's PNG decoder
+    and Pillow, at twice Pillow's `MAX_IMAGE_PIXELS`, both refuse a picture past it). The decoded sizes count, not the
+    header's; the request is refused at the picture that crosses it, and no later picture is decoded.
+  - **Image tokens:** at most 4,096 (the rows both ranks reserve), summed as the pictures are prepared and refused at
+    the picture that crosses it.
+  - **Thin pictures:** a picture too thin to keep one row or column once fitted to its grid (85,764:1 or wider, or
+    42,924:1 or taller) is refused, as Pillow refuses a resize to a zero side.
+  - A picture's decode buffers (RGB, padded RGB, patches) are freed once it is prepared; the request keeps only its
+    payload (the grid and bf16 patches, at most about 11 MB for a 1,024-token picture).
 - **Behaviour:** an image prompt skips the RAM prompt cache and the reuse hook (its tokens are
   placeholders); a 1920x1080 picture encodes in about 2.9 s on gfx1151 (measured with the tower on the engine thread).
   PNG decodes in Zig; other formats need Python 3 with Pillow (the runtime image's `rocm10.0-vision` tag).

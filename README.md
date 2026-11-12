@@ -49,8 +49,10 @@ or two Bosgame M5s to a first answer and a benchmark.
 | Toolchain | Zig 0.17.0, Python 3.13 |
 | Model | DeepSeek-V4.1-Flash-1017 as an EXL3 2.9 bpw pack (197 GB), plus its Engram shards (203 GB). Not included: download them yourself. |
 
-No NVIDIA driver, CUDA or NCCL is used. Text only: image input is not supported on this backend (for images
-through a small local vision model, see [docs/LOOK-AT-IMAGE.md](docs/LOOK-AT-IMAGE.md)).
+No NVIDIA driver, CUDA or NCCL is used. Text is the default; image input runs on the GPU with `MODALITIES=text_image`
+(the model's vision tower on the first box; setup and limits in
+[tools/dsv41-hip/ADAPTER.md](tools/dsv41-hip/ADAPTER.md) 8.1). Images can also go through a small local vision model:
+[docs/LOOK-AT-IMAGE.md](docs/LOOK-AT-IMAGE.md).
 
 ## What this fork adds
 
@@ -79,8 +81,9 @@ On a Bosgame M5 (same chip, ships with Windows), first follow [docs/BOSGAME-M5.m
 Driving it from an agent harness (tool calls, and keeping agents out of repeat loops):
 [docs/AGENTS.md](docs/AGENTS.md).
 
-Images for the text-only DeepSeek, through a small local vision model that describes them and answers follow-up
-questions: [docs/LOOK-AT-IMAGE.md](docs/LOOK-AT-IMAGE.md).
+Images: natively with `MODALITIES=text_image` (tools/dsv41-hip/ADAPTER.md 8.1), or for a text-only server through a
+small local vision model that describes them and answers follow-up questions:
+[docs/LOOK-AT-IMAGE.md](docs/LOOK-AT-IMAGE.md).
 
 ## Tuning the two boxes
 
@@ -90,7 +93,8 @@ power settings) is in [docs/TUNING.md](docs/TUNING.md). Most of it applies to an
 ## Known limits
 
 - Tested on this exact setup only. Other Strix Halo machines, ROCm versions and cables may behave differently.
-- Text only. Images can go through a small local vision model: [docs/LOOK-AT-IMAGE.md](docs/LOOK-AT-IMAGE.md).
+- Images are off unless `MODALITIES=text_image` is set. A request then takes at most 32 images (`MAX_IMAGES`),
+  134,217,728 decoded pixels and 4,096 image tokens in all; past any of them it is refused with a 400.
 - Provided as-is. Issues are welcome; support is best effort.
 
 ## Community

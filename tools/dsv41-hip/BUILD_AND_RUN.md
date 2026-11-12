@@ -18,8 +18,9 @@ addresses.
 | Memory | per rank: 98.1 GiB of weights (GTT 98.8 GiB measured) plus the KV arena (2.5-2.8 GiB at 8K context and one stream); keep at least 8 GiB MemAvailable while serving |
 | Disk, each box | the checkpoint `~/models/tf-port/libertai-2.9bpw` (LibertAI EXL3 2.9 bpw @ c178a012, 197 GB), the Engram shards 47/48 of DeepSeek-V4.1-Flash-1017 @ 1bae0e10 in `~/models/tf-port/ds1017-1bae0e10` (203 GB), and the input bundle `~/models/tf-port/inputs-tp2-c178a012` (that rank's 106 GB rank cache plus 0.1 GB of tables) |
 
-No NVIDIA driver, CUDA, NCCL or NVIDIA container is used or needed anywhere below. Image input is not supported (text
-only).
+No NVIDIA driver, CUDA, NCCL or NVIDIA container is used or needed anywhere below. The configuration below serves
+text; image input (`MODALITIES=text_image`, the vision tower on rank 0) needs the tower's sidecar and image routing
+biases, and is set up and limited as [ADAPTER.md](ADAPTER.md) 8.1 says.
 
 ## 2. Build (node1, from a clean committed tree)
 
@@ -153,4 +154,5 @@ That evidence lives on the boxes it was measured on, so on yours the suites abov
 - A request whose prompt plus `max_tokens` exactly fills the context is refused with a 500; one token over is a 400,
   as it should be.
 - After the other rank fails, rank 0 stays up answering 500 while `/health` still says "ok": restart both ranks.
-- Images are refused: the text capability never opens the vision tower.
+- With `MODALITIES=text` (the default) images are refused: the text capability never opens the vision tower. With
+  `text_image`, a request's images are limited as ADAPTER.md 8.1 says, each limit a 400.

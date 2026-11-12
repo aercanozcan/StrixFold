@@ -120,8 +120,11 @@ pub const Vision = struct {
     encode: ?Encode = null,
     /// The most image tokens one request may hold (the engine's reserved rows); 0: no limit.
     max_tokens: u32 = 0,
+    /// The most decoded pixels one request's images may hold together (Prepared.pixels summed); 0: no limit.
+    max_pixels: u64 = 0,
 
-    pub const Prepared = struct { tokens: u32, payload: []const u8 };
+    /// A picture's span length, its payload, and the pixels its decode held (0: not counted).
+    pub const Prepared = struct { tokens: u32, payload: []const u8, pixels: u64 = 0 };
     pub const PrepareError = error{ BadImage, OutOfMemory };
 };
 

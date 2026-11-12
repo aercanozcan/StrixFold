@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""make_vision_sidecar.py MODEL_DIR OUT_DIR [--expect TOTAL]: the vision tower's weights as a one-shard checkpoint the
-dsv41 tower opens (vit.zig Sources.open: TF_DS_VISION_DIR), copied byte for byte from a checkpoint that holds them
-(DeepSeek's original, or the LibertAI EXL3 one: its vision tensors are the original's, unquantized BF16).
-
-Selects the 266 tensors named vision.*, aligner.* and image_* through MODEL_DIR's model.safetensors.index.json, checks
-each one's dtype (BF16), shape and byte length, and writes OUT_DIR/vision.safetensors, OUT_DIR/model.safetensors.index.json
-and OUT_DIR/SHA256SUMS. Prints the tensors' identity: sha256 over the sorted names, each followed by its payload's
-sha256 hex (--expect TOTAL refuses another one; the 1017 release's is 32e3e2cc...). Authenticate MODEL_DIR's shards
-first (verify_hf_cache.py). Refuses an existing OUT_DIR file. Standard library only."""
+"""make_vision_sidecar.py MODEL_DIR OUT_DIR [--expect IDENTITY]: the vision tower as a one-shard checkpoint (README)."""
 import hashlib
 import json
 import os

@@ -5,8 +5,13 @@ const FakeText = @import("fake_text.zig").FakeText;
 const ScriptEngine = @import("fake_engine.zig").ScriptEngine;
 const api = @import("engine_api");
 
-fn imagePrepare(_: *anyopaque, _: std.mem.Allocator, bytes: []const u8, _: *[]const u8) api.Vision.PrepareError!api.Vision.Prepared {
-    return .{ .tokens = if (std.mem.eql(u8, bytes, "image-B")) 8 else 4, .payload = bytes };
+fn imagePrepare(_: *anyopaque, _: std.mem.Allocator, bytes: []const u8, problem: *[]const u8) api.Vision.PrepareError!api.Vision.Prepared {
+    if (std.mem.eql(u8, bytes, "image-X")) { // refused when prepared: a test sees whether a picture was reached
+        problem.* = "image input: fake_serve prepared image-X";
+        return error.BadImage;
+    }
+    const large = std.mem.eql(u8, bytes, "image-L"); // a large picture: few tokens, many pixels
+    return .{ .tokens = if (std.mem.eql(u8, bytes, "image-B")) 8 else 4, .payload = bytes, .pixels = if (large) 1 << 20 else 100 };
 }
 
 fn announce(port: u16) void {
@@ -50,9 +55,7 @@ pub fn main(init: std.process.Init) !u8 {
     var engine: ScriptEngine = .{ .gpa = gpa, .io = io, .text = text, .scripts = scripts, .info_ = .{ .lanes = server.cli.parallel(args.parallel) orelse 8, .context_window = context, .call_gates = true } };
     if (init.environ_map.get("TF_FAKE_VISION")) |v| if (std.mem.eql(u8, v, "1")) {
         const placeholder = "<\u{ff5c}deepseek_image\u{ff5c}>";
-        engine.info_.vision = .{ .ctx = &engine, .placeholder = placeholder,
-            .token = text.tokenId(placeholder) orelse return error.NoImageToken, .prepare = imagePrepare,
-            .max_tokens = if (init.environ_map.get("TF_FAKE_VISION_MAX")) |m| std.fmt.parseInt(u32, m, 10) catch 0 else 0 };
+        engine.info_.vision = .{ .ctx = &engine, .placeholder = placeholder, .token = text.tokenId(placeholder) orelse return error.NoImageToken, .prepare = imagePrepare, .max_tokens = if (init.environ_map.get("TF_FAKE_VISION_MAX")) |m| std.fmt.parseInt(u32, m, 10) catch 0 else 0, .max_pixels = if (init.environ_map.get("TF_FAKE_VISION_MAX_PIXELS")) |m| std.fmt.parseInt(u64, m, 10) catch 0 else 0 };
     };
     return server.serve.run(gpa, io, args, .{
         .engine = engine.engine(),

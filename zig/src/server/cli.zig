@@ -39,7 +39,7 @@ pub const flags = [_]Flag{
     .{ .name = "--vision", .kind = .store_true },
     .{ .name = "--vision-urls", .kind = .store_true },
     .{ .name = "--vision-offload", .kind = .store_true },
-    .{ .name = "--vision-max-images" },
+    .{ .name = "--vision-max-images", .native = true },
     .{ .name = "--vision-image-tokens" },
     .{ .name = "--context", .native = true },
     .{ .name = "--speed-up", .native = true },
@@ -118,6 +118,7 @@ pub const Args = struct {
     learn_dir: ?[]const u8 = null,
     learn_gib: f64 = 32, // disk for learned states, every model and build together
     max_tokens: i64 = 4096,
+    vision_max_images: u32 = 32, // image parts a request may carry (an engine with vision)
     temperature: ?f64 = null,
     top_p: ?f64 = null,
     top_k: ?i64 = null,
@@ -232,6 +233,10 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
     } else if (is(name, "--learn-gib")) {
         out.learn = true;
         out.learn_gib = try gib(u, a, name, v);
+    } else if (is(name, "--vision-max-images")) {
+        const n = try int(u, a, name, v);
+        if (n < 1) return fail(u, a, "argument --vision-max-images: expected an image count from 1: '{s}'", .{v});
+        out.vision_max_images = std.math.cast(u32, n) orelse std.math.maxInt(u32);
     } else if (is(name, "--max-tokens")) out.max_tokens = try int(u, a, name, v) else if (is(name, "--temperature")) out.temperature = try float(u, a, name, v) else if (is(name, "--top-p")) out.top_p = try float(u, a, name, v) else if (is(name, "--top-k")) out.top_k = try int(u, a, name, v) else if (is(name, "--min-p")) out.min_p = try float(u, a, name, v) else if (is(name, "--draft-temperature")) out.draft_temperature = try draftTemperature(u, a, name, v) else if (is(name, "--thinking")) out.thinking = true else if (is(name, "--no-thinking")) out.thinking = false else if (is(name, "--reasoning-effort")) out.reasoning_effort = v else if (is(name, "--thinking-budget")) out.thinking_budget = try int(u, a, name, v) else if (is(name, "--loop-guard")) out.loop_guard = true else if (is(name, "--no-drafts")) out.no_drafts = true else if (is(name, "--keep-warm")) out.keep_warm = try int(u, a, name, v) else if (is(name, "--compact-at")) {
         if (std.mem.eql(u8, v, "auto")) out.compact_auto = true else {
             const f = try float(u, a, name, v);
@@ -344,6 +349,10 @@ test "parse and capabilities share the table" {
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--compact-at", "0" }, &u));
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--compact-at", "2" }, &u));
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--compact-keep", "-1" }, &u));
+    try std.testing.expectEqual(@as(u32, 32), on.vision_max_images);
+    try std.testing.expectEqual(@as(u32, 4), (try parse(a, &.{ "m", "--vision-max-images", "4" }, &u)).vision_max_images);
+    for ([_][]const u8{ "0", "-1", "x" }) |bad| try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--vision-max-images", bad }, &u));
+    try std.testing.expect(std.mem.indexOf(u8, doc, "\"--vision-max-images\": {}") != null);
 }
 
 test "--device and --segments: CUDA builds serve them, values checked" {

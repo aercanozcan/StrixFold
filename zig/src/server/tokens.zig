@@ -29,7 +29,7 @@ fn tokenize(srv: *Server, cx: *Cx, body: Value) errors.Refused!Value {
     var ids: []const u32 = undefined;
     if (body.has("messages")) {
         const generation = try flag(cx, body, "add_generation_prompt", true);
-        var images: messages.Images = .{ .placeholder = if (srv.info.vision) |v| v.placeholder else "" };
+        var images: messages.Images = .{ .placeholder = if (srv.info.vision) |v| v.placeholder else "", .max = srv.config.max_images };
         const take: ?*messages.Images = if (srv.info.vision != null) &images else null;
         const msgs = try messages.normalizeImages(cx, body.get("messages"), "system", srv.needs_user_after_tool, srv.dialect, take);
         const tools = tool_specs.active(cx, body.get("tools"), body.get("tool_choice")) catch |e| switch (e) {

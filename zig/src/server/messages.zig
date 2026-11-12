@@ -130,6 +130,7 @@ fn withField(cx: *Cx, o: *const json.Object, key: []const u8, value: Value) !*js
 /// part's bytes in prompt order, the part itself the placeholder in its message's text.
 pub const Images = struct {
     placeholder: []const u8,
+    max: u32, // image parts a request may carry (--vision-max-images), counted before any is decoded
     list: std.ArrayList([]const u8) = .empty,
 };
 
@@ -167,15 +168,16 @@ fn escape(cx: *Cx, s: []const u8, ph: []const u8) ![]const u8 {
     return out.items;
 }
 
-/// Whether any message's content list holds an image part.
-fn hasImages(list: Value) bool {
+/// The image parts of the messages' content lists.
+fn imageCount(list: Value) usize {
+    var n: usize = 0;
     for (list.array) |message| {
         if (message != .object) continue;
         const content = message.get("content") orelse continue;
         if (content != .array) continue;
-        for (content.array) |part| if (isImagePart(part)) return true;
+        for (content.array) |part| n += @intFromBool(isImagePart(part));
     }
-    return false;
+    return n;
 }
 
 /// An ``image_url`` part's bytes: its URL (the part's string, or its object's ``url``) a base64 data URL, the base64 as
@@ -284,7 +286,9 @@ pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs
     if (list != .array) return cx.refuse("messages must be a non-empty list");
     // encode_messages renders an empty conversation as BOS alone
     if (list.array.len == 0) return if (dialect == .deepseek_v41) .{ .array = try cx.a.alloc(Value, 0) } else cx.refuse("messages must be a non-empty list");
-    const with_images = images != null and hasImages(list);
+    const count = if (images != null) imageCount(list) else 0;
+    if (count > 0 and count > images.?.max) return cx.fail(.request, "image input: the request carries {d} images (its earlier turns' included), more than the {d} this server takes in one request (--vision-max-images)", .{ count, images.?.max });
+    const with_images = count > 0;
     var out: std.ArrayList(Value) = .empty;
     var instructions: std.ArrayList(*json.Object) = .empty;
     for (list.array) |message| {
@@ -546,7 +550,7 @@ test "a message's own text holding the image placeholder is escaped" {
     defer arena.deinit();
     var cx: Cx = .{ .a = arena.allocator() };
     const ph = "<\u{ff5c}deepseek_image\u{ff5c}>";
-    var images: Images = .{ .placeholder = ph };
+    var images: Images = .{ .placeholder = ph, .max = 32 };
     const messages = (try json.parseText(cx.a,
         "[{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"see <\u{ff5c}deepseek_image\u{ff5c}> above\"}, {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,aGVsbG8=\"}}]}]"
     )).ok;

@@ -109,6 +109,8 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8) er
     const used = try cx.a.alloc(bool, images.len);
     @memset(used, false);
     var cursor: usize = 0;
+    var tokens: u64 = 0;
+    var pixels: u64 = 0;
     while (cursor < ids.len) {
         const id = ids[cursor];
         if (id != vision.token) {
@@ -131,13 +133,14 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8) er
         };
         try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload });
         try out.appendNTimes(cx.a, vision.token, prep.tokens);
+        // the limits refuse at the picture that crosses them, before any later one is decoded
+        pixels += prep.pixels;
+        tokens += prep.tokens;
+        const n = placed.items.len;
+        if (vision.max_pixels > 0 and pixels > vision.max_pixels) return cx.fail(.request, "image input: the images decode to {d} pixels by image {d} of {d}, more than the {d} this engine takes per request; send fewer or smaller images", .{ pixels, n, images.len, vision.max_pixels });
+        if (vision.max_tokens > 0 and tokens > vision.max_tokens) return cx.fail(.request, "image input: the images take {d} image tokens by image {d} of {d}, more than the {d} this engine holds per request; send fewer or smaller images", .{ tokens, n, images.len, vision.max_tokens });
     }
     if (placed.items.len != images.len) return cx.refuse("image input: the prompt holds fewer image placeholders than images");
-    if (vision.max_tokens > 0) {
-        var total: u64 = 0;
-        for (placed.items) |img| total += img.tokens;
-        if (total > vision.max_tokens) return cx.fail(.request, "image input: the images take {d} image tokens, more than the {d} this engine holds per request; send fewer or smaller images", .{ total, vision.max_tokens });
-    }
     return .{ .ids = out.items, .images = placed.items };
 }
 
