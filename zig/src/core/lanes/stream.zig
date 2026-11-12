@@ -118,6 +118,8 @@ pub const Vision = struct {
 
     /// A tower that encodes off the engine thread (HIP's); null: the prompt pass runs it.
     encode: ?Encode = null,
+    /// The most image tokens one request may hold (the engine's reserved rows); 0: no limit.
+    max_tokens: u32 = 0,
 
     pub const Prepared = struct { tokens: u32, payload: []const u8 };
     pub const PrepareError = error{ BadImage, OutOfMemory };

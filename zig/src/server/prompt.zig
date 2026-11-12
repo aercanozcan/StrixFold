@@ -133,6 +133,11 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8) er
         try out.appendNTimes(cx.a, vision.token, prep.tokens);
     }
     if (placed.items.len != images.len) return cx.refuse("image input: the prompt holds fewer image placeholders than images");
+    if (vision.max_tokens > 0) {
+        var total: u64 = 0;
+        for (placed.items) |img| total += img.tokens;
+        if (total > vision.max_tokens) return cx.fail(.request, "image input: the images take {d} image tokens, more than the {d} this engine holds per request; send fewer or smaller images", .{ total, vision.max_tokens });
+    }
     return .{ .ids = out.items, .images = placed.items };
 }
 

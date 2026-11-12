@@ -217,6 +217,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
     errdefer if (st.encoder) |enc| stopEncoder(gpa, enc);
     st.lanes.encoder = st.encoder;
     var hook: ?lanes.stream.Vision = if (gpu.features.vision) (if (st.vision) |v| v.hook() else null) else null;
+    if (hook) |*x| x.max_tokens = if (model.Model.image_rows_cap) |cap| @intCast(cap) else 0;
     if (hook) |*x| if (st.encoder) |enc| {
         x.encode = enc.hook();
     };
