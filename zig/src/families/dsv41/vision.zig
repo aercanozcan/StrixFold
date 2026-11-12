@@ -120,52 +120,7 @@ pub const Vision = struct {
 
     fn prepareFn(ctx: *anyopaque, a: std.mem.Allocator, bytes: []const u8, problem: *[]const u8) lanes.stream.Vision.PrepareError!lanes.stream.Vision.Prepared {
         const v: *Vision = @ptrCast(@alignCast(ctx));
-        var rgb = try v.decode(a, bytes, problem);
-        defer rgb.deinit(a);
-        var pic = picture.fromRgb(a, rgb, v.cfg) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.EmptySide => {
-                problem.* = "image input: height and width must be > 0";
-                return error.BadImage;
-            },
-        };
-        defer pic.deinit(a);
-        const g = pic.grid;
-        const payload = try a.alignedAlloc(u8, .@"16", header_bytes + pic.patches.len * 2);
-        @memset(payload[0..header_bytes], 0);
-        for ([_]usize{ g.best_h, g.best_w, g.n_vit_h, g.n_vit_w, g.n_llm_h, g.n_llm_w }, 0..) |x, i| std.mem.writeInt(u32, payload[i * 4 ..][0..4], @intCast(x), .little);
-        @memcpy(payload[header_bytes..], std.mem.sliceAsBytes(pic.patches));
-        return .{ .tokens = @intCast(g.spanTokens()), .payload = payload };
-    }
-
-    /// The image's RGB as the lane's Pillow decodes it: picture.zig's PNG, else Pillow's own (the refusal in the lane's
-    /// words on BadImage).
-    fn decode(v: *Vision, a: std.mem.Allocator, bytes: []const u8, problem: *[]const u8) lanes.stream.Vision.PrepareError!picture.Rgb {
-        if (picture.decodePng(a, bytes)) |rgb| return rgb else |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.TooLarge => {
-                problem.* = try std.fmt.allocPrint(a, "Image size ({d} pixels) exceeds limit of {d} pixels, could be decompression bomb DOS attack.", .{ picture.pixels(bytes) orelse 0, picture.max_pixels });
-                return error.BadImage;
-            },
-            else => {}, // not a PNG this decoder reads: Pillow's
-        }
-        const p = v.pil orelse {
-            problem.* = "image input: cannot identify image file (no Pillow on this server for formats other than PNG)";
-            return error.BadImage;
-        };
-        const got = p.decode(a, bytes) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            std.debug.print("{{\"vision\": \"Pillow's child failed ({s})\"}}\n", .{@errorName(err)});
-            problem.* = "image input: the image decoder failed";
-            return error.BadImage;
-        };
-        switch (got) {
-            .rgb => |rgb| return rgb,
-            .refused => |m| {
-                problem.* = m;
-                return error.BadImage;
-            },
-        }
+        return prepared(v.pil, v.cfg, a, bytes, problem);
     }
 
     /// A prepared picture's span rows bf16 [tokens, 5120] appended to `out` (the tower on its stream, then the rows to
@@ -192,10 +147,84 @@ pub const Vision = struct {
     }
 };
 
+/// An image's payload, or on BadImage its refusal, in `a`; its decode, plan and patches in a scratch arena freed here.
+fn prepared(p: ?*pil.Pil, cfg: picture.Config, a: std.mem.Allocator, bytes: []const u8, problem: *[]const u8) lanes.stream.Vision.PrepareError!lanes.stream.Vision.Prepared {
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const s = scratch.allocator();
+    const rgb = decode(p, s, bytes, problem) catch |err| {
+        if (err == error.BadImage) problem.* = try a.dupe(u8, problem.*);
+        return err;
+    };
+    const pic = picture.fromRgb(s, rgb, cfg) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.EmptySide => {
+            problem.* = "image input: height and width must be > 0";
+            return error.BadImage;
+        },
+    };
+    const g = pic.grid;
+    const payload = try a.alignedAlloc(u8, .@"16", header_bytes + pic.patches.len * 2);
+    @memset(payload[0..header_bytes], 0);
+    for ([_]usize{ g.best_h, g.best_w, g.n_vit_h, g.n_vit_w, g.n_llm_h, g.n_llm_w }, 0..) |x, i| std.mem.writeInt(u32, payload[i * 4 ..][0..4], @intCast(x), .little);
+    @memcpy(payload[header_bytes..], std.mem.sliceAsBytes(pic.patches));
+    return .{ .tokens = @intCast(g.spanTokens()), .payload = payload };
+}
+
+/// The image's RGB as the lane's Pillow decodes it: picture.zig's PNG, else Pillow's own (the refusal in the lane's
+/// words on BadImage).
+fn decode(p: ?*pil.Pil, a: std.mem.Allocator, bytes: []const u8, problem: *[]const u8) lanes.stream.Vision.PrepareError!picture.Rgb {
+    if (picture.decodePng(a, bytes)) |rgb| return rgb else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.TooLarge => {
+            problem.* = try std.fmt.allocPrint(a, "Image size ({d} pixels) exceeds limit of {d} pixels, could be decompression bomb DOS attack.", .{ picture.pixels(bytes) orelse 0, picture.max_pixels });
+            return error.BadImage;
+        },
+        else => {}, // not a PNG this decoder reads: Pillow's
+    }
+    const pl = p orelse {
+        problem.* = "image input: cannot identify image file (no Pillow on this server for formats other than PNG)";
+        return error.BadImage;
+    };
+    const got = pl.decode(a, bytes) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        std.debug.print("{{\"vision\": \"Pillow's child failed ({s})\"}}\n", .{@errorName(err)});
+        problem.* = "image input: the image decoder failed";
+        return error.BadImage;
+    };
+    switch (got) {
+        .rgb => |rgb| return rgb,
+        .refused => |m| {
+            problem.* = m;
+            return error.BadImage;
+        },
+    }
+}
+
 test "a payload's grid reads back" {
     var buf: [header_bytes]u8 = undefined;
     for ([_]u32{ 462, 644, 33, 46, 11, 16 }, 0..) |x, i| std.mem.writeInt(u32, buf[i * 4 ..][0..4], x, .little);
     try std.testing.expectEqual(@as(u32, 11), std.mem.readInt(u32, buf[16..20], .little));
     const g: picture.Grid = .{ .best_h = 462, .best_w = 644, .n_vit_h = 33, .n_vit_w = 46, .n_llm_h = 11, .n_llm_w = 16 };
     try std.testing.expectEqual(@as(usize, 189), g.spanTokens());
+}
+
+test "a prepared picture leaves only its payload in the request's allocator, and a refusal only its text" {
+    var png: [70]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&png, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==");
+    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    const a = fa.allocator();
+    var problem: []const u8 = "";
+    const prep = try prepared(null, .{}, a, &png, &problem);
+    defer a.free(@as([]align(16) const u8, @alignCast(prep.payload)));
+    try std.testing.expectEqual(@as(usize, 1), fa.allocations);
+    const n_vit_h = std.mem.readInt(u32, prep.payload[8..12], .little);
+    const n_vit_w = std.mem.readInt(u32, prep.payload[12..16], .little);
+    try std.testing.expectEqual(header_bytes + @as(usize, n_vit_h) * n_vit_w * 14 * 14 * 3 * 2, prep.payload.len);
+    try std.testing.expectEqual(@as(u32, 13 * 14 + 2), prep.tokens);
+    var fb = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.BadImage, prepared(null, .{}, fb.allocator(), "GIF89a", &problem));
+    defer fb.allocator().free(problem);
+    try std.testing.expectEqual(@as(usize, 1), fb.allocations);
+    try std.testing.expect(std.mem.indexOf(u8, problem, "cannot identify image file") != null);
 }
