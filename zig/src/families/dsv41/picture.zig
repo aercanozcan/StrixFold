@@ -218,23 +218,31 @@ pub fn decodePng(a: Allocator, data: []const u8) Error!Rgb {
     if (!ok_depth) return error.UnsupportedPng;
     const bits = channels * depth;
     const bpp = @max(1, bits / 8);
+    const passes: [7][4]usize = .{ .{ 0, 0, 8, 8 }, .{ 4, 0, 8, 8 }, .{ 0, 4, 4, 8 }, .{ 2, 0, 4, 4 }, .{ 0, 2, 2, 4 }, .{ 1, 0, 2, 2 }, .{ 0, 1, 1, 2 } };
+    const one: [1][4]usize = .{.{ 0, 0, 1, 1 }};
+    const list: []const [4]usize = if (interlace == 1) &passes else &one;
 
-    // the passes' filtered rows, inflated
-    var raw: std.Io.Writer.Allocating = .init(a);
-    defer raw.deinit();
+    // the bytes of the filtered rows the header declares (w * h is within max_pixels, so the sum cannot overflow)
+    var need: usize = 0;
+    for (list) |ps| {
+        if (ps[0] >= w or ps[1] >= h) continue;
+        need += (h - ps[1] + ps[3] - 1) / ps[3] * (1 + ((w - ps[0] + ps[2] - 1) / ps[2] * bits + 7) / 8);
+    }
+
+    // inflated into those bytes alone: an error met on the way, one symbol of lookahead included, is refused
+    const zdata = try a.alloc(u8, need);
+    defer a.free(zdata);
     {
         var in: std.Io.Reader = .fixed(idat.items);
         var z: std.compress.flate.Decompress = .init(&in, .zlib, &.{});
-        _ = z.reader.streamRemaining(&raw.writer) catch return error.BadPng;
+        var out: std.Io.Writer = .fixed(zdata);
+        z.reader.streamExact(&out, need) catch return error.BadPng;
     }
-    const zdata = raw.written();
+    idat.clearAndFree(a);
 
     // samples per pixel at full depth for the whole image: [h][w][channels] as u16
     const samples = try a.alloc(u16, w * h * channels);
     defer a.free(samples);
-    const passes: [7][4]usize = .{ .{ 0, 0, 8, 8 }, .{ 4, 0, 8, 8 }, .{ 0, 4, 4, 8 }, .{ 2, 0, 4, 4 }, .{ 0, 2, 2, 4 }, .{ 1, 0, 2, 2 }, .{ 0, 1, 1, 2 } };
-    const one: [1][4]usize = .{.{ 0, 0, 1, 1 }};
-    const list: []const [4]usize = if (interlace == 1) &passes else &one;
     var off: usize = 0;
     var prev: std.ArrayList(u8) = .empty;
     defer prev.deinit(a);
