@@ -365,7 +365,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         .imports = &.{ .{ .name = "gpu", .module = rs_gpu }, .{ .name = "dsv41", .module = rs_family } },
     }) });
     gpu_test.dependOn(&b.addInstallArtifact(glue_test, .{ .dest_dir = .{ .override = install_test } }).step);
-    // the vision tower against engineLab's host reference, step by step (tools/vision-golden's dumps)
+    // the vision tower against the host reference, step by step (tools/dsv41-hip/vision-reference's dumps)
     const vision_check = b.addExecutable(.{ .name = "tf-dsv41-vision-check", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/tests/dsv41_hip/vision_check.zig"),
         .target = target,

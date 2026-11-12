@@ -1,4 +1,4 @@
-//! tf-dsv41-vision-check: the HIP vision tower against engineLab's encode_reference dumps, byte for byte, by step.
+//! tf-dsv41-vision-check: the HIP vision tower against the host reference's dumps (tools/dsv41-hip/vision-reference).
 const std = @import("std");
 const gpu = @import("gpu");
 const dsv41 = @import("dsv41");
@@ -121,7 +121,7 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("usage: tf-dsv41-vision-check --golden DIR [--kit DIR --weights DIR] [--case NAME]... [--out DIR] [--prep-only]\n", .{});
         return 2;
     }
-    // every case folder of --golden (tools/vision-golden: grid.json, rgb.u8, patches.bf16, each step's .bf16 / .f32)
+    // every case folder of --golden (vision-reference: grid.json, rgb.u8, patches.bf16, each step's .bf16 / .f32)
     if (cases.items.len == 0) {
         var dir = try std.Io.Dir.cwd().openDir(io, golden.?, .{ .iterate = true });
         defer dir.close(io);

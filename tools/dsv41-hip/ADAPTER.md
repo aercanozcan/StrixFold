@@ -385,9 +385,11 @@ tower on rank 0. Everything above about `text` still holds: a text rank opens, l
   `declared_exp` / `declared_sqrt`, its erf fdlibm's `erff`: THIRD_PARTY_NOTICES.md), not torch's kernels: every linear one FP32 fma chain over k ascending per output (bf16 after the bias),
   RMSNorm a wave-order sum with a correctly rounded root, attention a fused online softmax over 64-key tiles with a
   declared exp, the 2D RoPE tables built on the host in double precision (libc pow / cos / sin), erf-GELU the fdlibm
-  approximations. Gate: `tf-dsv41-vision-check` (dsv41-hip-gpu-test) against engineLab's `encode_reference` dumps
-  (`tools/vision-golden` in the deployment repo): every step (RoPE tables, patch embed, all 32 blocks, final norm,
-  aligner rows) and the span byte for byte, and picture.zig's patches against the reference's prep. Fidelity (not
+  approximations. Gate: `tf-dsv41-vision-check` (dsv41-hip-gpu-test) against the host reference's dumps
+  (`tools/dsv41-hip/vision-reference`: engineLab's `encode_reference`, its sources carried here; `make_golden.sh`
+  regenerates the golden of three synthetic pictures from a vision sidecar, `fetch_golden.sh` downloads the published
+  one, `SHA256SUMS` pins both): every step (RoPE tables, patch embed, all 32 blocks, final norm, aligner rows) and the
+  span byte for byte, and picture.zig's patches against the reference's prep. Fidelity (not
   bitwise; CUDA's vit.zig bytes differ too), mean row cosine of the aligner rows on six pictures (2026-11-10): 0.9978 to
   0.9997 against the release's FP32 torch tower, 0.9993 to 0.9998 against its BF16 CUDA run (the release's own BF16
   run is 0.9977 to 0.9998 against FP32); the release's prep gave the same patches on all six.
