@@ -20,7 +20,8 @@ serve_load() {
   for v in DEPLOY_DIR BUNDLE MODEL_DIR RANK_CACHE DS_KIT ENGRAM_DIR TOKEN_MAP RUN_ROOT; do eval "$v=\"${!v}\""; done
   # images (MODALITIES=text_image): rank 0's tower weights (VISION_DIR, a sidecar with its SHA256SUMS) and both ranks'
   # routing biases (DS_KIT/vision/gate_bias_vl.safetensors, pinned by VISION_BIAS_SHA256); TEST_FAULT: recovery tests
-  VISION_DIR=${VISION_DIR:-} VISION_BIAS_SHA256=${VISION_BIAS_SHA256:-} TEST_FAULT=${TEST_FAULT:-}
+  VISION_DIR=${VISION_DIR:-} VISION_BIAS_SHA256=${VISION_BIAS_SHA256:-} TEST_FAULT=${TEST_FAULT:-} MAX_IMAGES=${MAX_IMAGES:-}
+  [ -z "$MAX_IMAGES" ] || [[ $MAX_IMAGES =~ ^[1-9][0-9]*$ ]] || die "MAX_IMAGES must be an image count from 1 (empty: the server's 32), not $MAX_IMAGES"
   [ -n "$VISION_DIR" ] && eval "VISION_DIR=\"$VISION_DIR\""
   case $MODALITIES in text|text_image) ;; *) die "MODALITIES must be text or text_image, not $MODALITIES";; esac
   BIN=$DEPLOY_DIR/native-hip/bin
@@ -174,6 +175,8 @@ serve_cmd() {
     # (0: the flag is left out, the argv of a build without it)
     awk -v t="$DRAFT_TEMPERATURE" 'BEGIN { exit !(t > 0) }' && SERVE_CMD+=(--draft-temperature "$DRAFT_TEMPERATURE")
     [ "$DRAFTS" = 1 ] || SERVE_CMD+=(--no-drafts)
+    # (empty: the flag is left out, the server's default)
+    [ -z "$MAX_IMAGES" ] || SERVE_CMD+=(--vision-max-images "$MAX_IMAGES")
   else
     serve_lanes_cmd
     [ -n "${LOGITS_SHA:-}" ] && SERVE_CMD+=(--logits-sha "$LOGITS_SHA")
