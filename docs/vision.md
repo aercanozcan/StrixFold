@@ -89,6 +89,11 @@ only.
 
 ## Limits and state
 
+This section describes `tensorfold serve --vision` (MLX and CUDA). The native DeepSeek-V4.1 server on HIP
+(`MODALITIES=text_image`) has limits of its own: its `--vision-max-images` defaults to 32 (serve.conf `MAX_IMAGES`),
+and the byte and pixel limits below do not apply to it; see [tools/dsv41-hip/ADAPTER.md](../tools/dsv41-hip/ADAPTER.md)
+8.1.
+
 Requests accept up to four JPEG, PNG or WebP images by default. `--vision-max-images N` sets a positive
 image-count limit when serving with `--vision`, on both backends:
 
