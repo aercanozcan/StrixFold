@@ -2,8 +2,8 @@
 deepseek-ai/DeepSeek-V4.1-Flash (MIT), or of an EXL3 checkpoint that keeps them, standard library only.
 
 The MoE gates' routing bias for image-span tokens (`*.ffn.gate.bias_vl`, f32: in the 1017 release 40 layers of 384
-experts and 3 MTP layers of 128) is not in the serving bundle. The LibertAI EXL3 1017 checkpoint (c178a012) keeps them
-unquantized (older EXL3 revisions left them out). This copies those tensors, byte for byte, from the shards (found through its
+experts and 3 MTP layers of 128) is not in the serving bundle. The LibertAI EXL3 1017 checkpoint (c178a012) keeps it
+unquantized (older EXL3 revisions do not). This copies those tensors, byte for byte, from the shards (found through its
 model.safetensors.index.json; only the shards that hold them are opened, and only those bytes are read) into one small
 safetensors file. The digest it prints is the one the released kit's README lists."""
 import hashlib

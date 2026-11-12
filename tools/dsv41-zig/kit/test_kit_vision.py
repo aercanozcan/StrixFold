@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""Host tests of make_vision_sidecar.py and verify_hf_cache.py (python3 -m unittest tools/dsv41-zig/kit/test_kit_vision.py).
-
-The checkpoint is a sparse file with the tower's real names and shapes (about 970 MB read as zeros, no disk used)."""
+"""Host tests of make_vision_sidecar.py and verify_hf_cache.py on a sparse checkpoint of the tower's real shapes."""
 import hashlib
 import json
 import os
@@ -18,7 +16,7 @@ import make_vision_sidecar as mvs  # noqa: E402
 
 
 def fake_checkpoint(root, extra=None, drop=None, shape_of=None):
-    """A two-shard checkpoint: a text tensor in shard 1, the 266 vision tensors (sparse zeros) in shard 2."""
+    """A two-shard checkpoint: a text tensor in shard 1, the 266 vision tensors in shard 2 (sparse, no disk used)."""
     root.mkdir(parents=True, exist_ok=True)
     names = sorted(n for n in mvs.SHAPES if n != drop)
     hdr, off = {}, 0

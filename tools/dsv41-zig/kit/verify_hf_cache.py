@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""verify_hf_cache.py MODEL_DIR REVISION [FILE...]: each file of a huggingface_hub download checked against the sha256
-the Hub reported when it was downloaded (MODEL_DIR/.cache/huggingface/download/<file>.metadata: revision, etag, time).
-An LFS file's etag is its sha256; a file kept in git (often the index) has its git blob sha1 instead, checked as git
-computes it (sha1 of "blob <size>\0" + the bytes).
-
-With no FILE: model.safetensors.index.json and every shard it names. A file passes when its metadata names REVISION
-and its etag is a sha256 equal to the file's own. Prints one JSON report (status pass/fail, each file's sha256);
-exit 1 on any failure. Reads the files with POSIX_FADV_DONTNEED so a large checkpoint does not fill the page cache.
-Standard library only."""
+"""verify_hf_cache.py MODEL_DIR REVISION [FILE...]: a Hub download's files against the digests the Hub gave (README)."""
 import hashlib
 import json
 import os

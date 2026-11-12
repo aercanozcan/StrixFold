@@ -36,7 +36,7 @@ static __device__ __forceinline__ float tf_ds_v_exp(float x) {
     return (p * tf_ds_v_pow2(k1)) * tf_ds_v_pow2(k2);
 }
 
-// declared_sqrt of strix-halo-engine-lab (hyukudan, Apache-2.0): the float rounding of the correctly rounded double root.
+// declared_sqrt of strix-halo-engine-lab (hyukudan, Apache-2.0): the correctly rounded double root, rounded to float.
 static __device__ __forceinline__ float tf_ds_v_sqrt(float x) { return (float)__dsqrt_rn((double)x); }
 
 // erff of fdlibm as musl carries it (FreeBSD s_erff.c). Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved. Developed at SunPro, a Sun Microsystems, Inc. business. Permission to use, copy, modify, and distribute this software is freely granted, provided that this notice is preserved.

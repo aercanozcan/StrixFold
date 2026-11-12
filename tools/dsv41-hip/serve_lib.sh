@@ -18,8 +18,7 @@ serve_load() {
   local v
   # in this order: a path may name one expanded before it ($BUNDLE)
   for v in DEPLOY_DIR BUNDLE MODEL_DIR RANK_CACHE DS_KIT ENGRAM_DIR TOKEN_MAP RUN_ROOT; do eval "$v=\"${!v}\""; done
-  # images (MODALITIES=text_image): rank 0's tower weights (VISION_DIR, a sidecar with its SHA256SUMS) and both ranks'
-  # routing biases (DS_KIT/vision/gate_bias_vl.safetensors, pinned by VISION_BIAS_SHA256); TEST_FAULT: recovery tests
+  # the image settings serve.conf describes and TEST_FAULT (TF_DS_TEST_FAULT, recovery tests); empty when not set
   VISION_DIR=${VISION_DIR:-} VISION_BIAS_SHA256=${VISION_BIAS_SHA256:-} TEST_FAULT=${TEST_FAULT:-} MAX_IMAGES=${MAX_IMAGES:-}
   [ -z "$MAX_IMAGES" ] || [[ $MAX_IMAGES =~ ^[1-9][0-9]*$ ]] || die "MAX_IMAGES must be an image count from 1 (empty: the server's 32), not $MAX_IMAGES"
   [ -n "$VISION_DIR" ] && eval "VISION_DIR=\"$VISION_DIR\""
