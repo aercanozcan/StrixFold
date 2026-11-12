@@ -122,10 +122,12 @@ pub const Vision = struct {
         const v: *Vision = @ptrCast(@alignCast(ctx));
         var rgb = try v.decode(a, bytes, problem);
         defer rgb.deinit(a);
-        var pic = picture.fromRgb(a, rgb, v.cfg) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            problem.* = "image input: the image could not be prepared";
-            return error.BadImage;
+        var pic = picture.fromRgb(a, rgb, v.cfg) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.EmptySide => {
+                problem.* = "image input: height and width must be > 0";
+                return error.BadImage;
+            },
         };
         defer pic.deinit(a);
         const g = pic.grid;

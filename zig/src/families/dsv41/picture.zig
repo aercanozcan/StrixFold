@@ -488,9 +488,9 @@ fn resampleBox(a: Allocator, src: Rgb, xsize: usize, ysize: usize, box: [4]f64) 
     return .{ .w = src.w, .h = src.h, .px = try a.dupe(u8, src.px) };
 }
 
-/// Image.resize(size, BICUBIC) of an RGB image (the whole source as the box), with PIL's two steps for a source more
-/// than 100 times taller than wide being shortened.
+/// Image.resize(size, BICUBIC) of the whole source, a side of 0 refused as PIL does; past 100:1 tall, the height first.
 pub fn resize(a: Allocator, src: Rgb, w: usize, h: usize) !Rgb {
+    if (w == 0 or h == 0) return error.EmptySide;
     if (w == src.w and h == src.h) return .{ .w = w, .h = h, .px = try a.dupe(u8, src.px) };
     const fw: f64 = @floatFromInt(src.w);
     const fh: f64 = @floatFromInt(src.h);

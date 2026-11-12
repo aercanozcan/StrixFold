@@ -111,6 +111,7 @@ pub const Pil = struct {
         const h: usize = @intCast(std.mem.readInt(u64, head[9..17], .little));
         const n: usize = @intCast(std.mem.readInt(u64, head[17..25], .little));
         if (head[0] == 0 and n != w * h * 3) return error.BadPillowReply;
+        if (head[0] == 0 and (w == 0 or h == 0)) return .{ .refused = try a.dupe(u8, "image input: height and width must be > 0") };
         const body = try a.alloc(u8, n);
         errdefer a.free(body);
         try p.reader.interface.readSliceAll(body);

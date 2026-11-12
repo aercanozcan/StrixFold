@@ -49,7 +49,14 @@ pub fn main(init: std.process.Init) !u8 {
             continue;
         };
         const g = picture.plan(rgb.w, rgb.h, .{});
-        var padded = try picture.pad(a, rgb, g.best_w, g.best_h);
+        var padded = picture.pad(a, rgb, g.best_w, g.best_h) catch |e| switch (e) {
+            error.EmptySide => {
+                try w.print("{{\"file\": \"{s}\", \"refused\": \"image input: height and width must be > 0\"}}\n", .{path});
+                rgb.deinit(a);
+                continue;
+            },
+            else => |x| return x,
+        };
         const patches = try picture.patchify(a, padded, 14);
         try w.print("{{\"file\": \"{s}\", \"w\": {d}, \"h\": {d}, \"best_w\": {d}, \"best_h\": {d}, \"n_vit_h\": {d}, \"n_vit_w\": {d}, \"n_llm_h\": {d}, \"n_llm_w\": {d}, \"rgb_sha256\": \"{s}\", \"pad_sha256\": \"{s}\", \"patches_sha256\": \"{s}\"}}\n", .{
             path,        rgb.w,          rgb.h,                              g.best_w, g.best_h, g.n_vit_h, g.n_vit_w, g.n_llm_h, g.n_llm_w,
