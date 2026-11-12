@@ -21,8 +21,9 @@ const draft = @import("draft.zig");
 const sampling = @import("sampling.zig");
 const link = @import("link.zig");
 const gpu = @import("gpu");
-/// The vision tower's type: CUDA builds only (gpu.features.vision); an empty type a HIP build never fills.
+/// The vision tower's type (vision.zig: CUDA's vit.zig, HIP's vit_hip.zig); an empty type in a build without one.
 pub const VisionTower = if (gpu.features.vision) @import("vision.zig").Vision else opaque {};
+const Encoder = @import("encoder.zig").Encoder;
 
 const be = lanes.backend;
 const grammar = lanes.grammar;
@@ -35,6 +36,28 @@ pub const window_rows = 6;
 
 /// The image rows a fill_images frame carries at most.
 pub const image_piece = 32 << 10;
+
+/// A request's image span rows, all its pictures together.
+pub fn spanRows(images: []const lanes.stream.Image) usize {
+    var n: usize = 0;
+    for (images) |img| n += img.tokens;
+    return n;
+}
+
+/// Whether a request's image rows fit what both ranks reserved (model.Model.image_rows_cap; none: any).
+pub fn imageRowsFit(rows: usize) bool {
+    const cap = model.Model.image_rows_cap orelse return true;
+    return rows <= cap;
+}
+
+test "a request's image rows are capped at the rows both HIP ranks reserved" {
+    const Image = lanes.stream.Image;
+    const two = [_]Image{ .{ .at = 0, .tokens = 2048, .bytes = "" }, .{ .at = 4096, .tokens = 2048, .bytes = "" } };
+    const over = [_]Image{ .{ .at = 0, .tokens = 2048, .bytes = "" }, .{ .at = 4096, .tokens = 2049, .bytes = "" } };
+    try std.testing.expectEqual(@as(usize, 4096), spanRows(&two));
+    try std.testing.expect(imageRowsFit(spanRows(&two)) and imageRowsFit(0));
+    try std.testing.expectEqual(gpu.backend != .hip, imageRowsFit(spanRows(&over)));
+}
 
 /// A gate's diagnostic (the tools' --logits-sha 1): each prompt's logits' sha256 and rows on stderr.
 pub var logits_sha = false;
@@ -459,6 +482,7 @@ pub const Lanes = struct {
     m: *Model,
     peer: ?link.Link, // rank 1 (null: one rank); every follower gets each frame (Model.followers)
     vision: ?*VisionTower = null, // rank 0's tower (a vision checkpoint served with its kit's vision/; CUDA builds only)
+    encoder: ?*Encoder = null, // HIP: that tower on its own thread; the prompt pass takes its rows
     step: u64 = 0,
     wire: Wire = .{},
     streams: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
@@ -596,6 +620,7 @@ pub const Lanes = struct {
         const len = ids.len;
         if (len == 0) return error.EmptyPrompt;
         if (len + s.max_new > usableContext(m.pool_cap, m.eng.round_rows)) return error.PromptTooLong;
+        if (!imageRowsFit(spanRows(s.images))) return error.TooManyImageRows;
         const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
         if (self.streams.fetchRemove(s)) |old| {
             self.used[old.value.slot] = false;
@@ -686,7 +711,7 @@ pub const Lanes = struct {
             const image_id = m.cfg.image_token orelse return error.NoVision;
             const row_bytes = m.cfg.hidden * 2;
             var at_row: usize = 0;
-            for (s.images) |img| {
+            for (s.images, 0..) |img, k| {
                 if (img.tokens == 0 or @as(usize, img.at) + img.tokens > len) return error.BadImageSpan;
                 for (seq.items[img.at..][0..img.tokens]) |*q| {
                     if (q.* != @as(i64, image_id)) return error.BadImageSpan;
@@ -696,10 +721,12 @@ pub const Lanes = struct {
                     if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
                     try rows.appendSlice(gpa, img.bytes);
                 } else {
-                    // a prepared picture (vision.zig): the tower's span rows, here on rank 0
+                    // a prepared picture (vision.zig): the tower's span rows on rank 0 (HIP: from its encoder thread)
                     if (!gpu.features.vision) return error.NoVisionTower;
                     const v = self.vision orelse return error.NoVisionTower;
-                    if (try v.rows(img.bytes, gpa, &rows) != img.tokens) return error.BadImageSpan;
+                    if (testFault(.tower)) return error.InjectedFault;
+                    const t = if (self.encoder) |enc| try enc.take(s.images, k, gpa, &rows) else try v.rows(img.bytes, gpa, &rows);
+                    if (t != img.tokens) return error.BadImageSpan;
                 }
                 try spans.append(gpa, .{ .at = img.at, .len = img.tokens, .row = at_row });
                 at_row += img.tokens;
@@ -716,7 +743,10 @@ pub const Lanes = struct {
             // the spans and their rows, image_piece bytes of rows a frame (a follower's frame buffer holds 64 KiB and
             // the ids of a full pool)
             var off: usize = 0;
+            var pieces: usize = 0;
             while (off < rows.items.len) {
+                if (testFaultAt(.fill_images, pieces)) return error.InjectedFault;
+                pieces += 1;
                 const n = @min(image_piece, rows.items.len - off);
                 if (try self.begin(.fill_images)) {
                     try self.wire.int(gpa, u32, @intCast(spans.items.len));
@@ -1274,6 +1304,34 @@ pub fn survivals(conf: []const f32, out: []f64) void {
     }
 }
 
+/// TF_DS_TEST_FAULT (recovery tests only; unset: never): one injected image-path failure, the first time it is reached.
+const Fault = enum {
+    tower, // rank 0 refuses a picture at its prompt pass
+    fill_images, // fill_images:K: rank 0 fails a prompt after sending K pieces of its rows to rank 1 (the pair stays)
+    set_images, // rank 1 fails to take a prompt's complete image rows
+};
+var fault_fired: std.atomic.Value(bool) = .init(false);
+
+fn faultSetting() ?struct { kind: Fault, at: usize } {
+    const v = std.mem.span(std.c.getenv("TF_DS_TEST_FAULT") orelse return null);
+    const colon = std.mem.indexOfScalar(u8, v, ':');
+    const kind = std.meta.stringToEnum(Fault, v[0 .. colon orelse v.len]) orelse return null;
+    const at = if (colon) |c| std.fmt.parseInt(usize, v[c + 1 ..], 10) catch return null else 0;
+    return .{ .kind = kind, .at = at };
+}
+
+fn testFaultAt(kind: Fault, at: usize) bool {
+    const f = faultSetting() orelse return false;
+    if (f.kind != kind or f.at != at) return false;
+    if (fault_fired.swap(true, .acq_rel)) return false;
+    std.log.warn("lanes: TF_DS_TEST_FAULT={s}: failing here once", .{@tagName(kind)});
+    return true;
+}
+
+fn testFault(kind: Fault) bool {
+    return testFaultAt(kind, 0);
+}
+
 /// A primitive this rank refused: rank 0 runs the same one on the same inputs and refuses it at the same step (its
 /// request ends with the error), so the follower reports it and takes the next frame instead of ending; unless the
 /// pair itself failed (broken), which ends the follower (U47).
@@ -1287,6 +1345,8 @@ fn refused(err: anyerror) !void {
 fn broken(err: anyerror) bool {
     return switch (err) {
         error.CollectiveFailed, error.PeerLost, error.Timeout, error.Mismatch, error.Aborted, error.PeerDown, error.OutOfStep, error.FrameTooLong => true,
+        // a sticky device fault (illegal address, launch failure): every later call fails, so the pair restarts
+        error.DeviceFault => true,
         else => false,
     };
 }
@@ -1419,11 +1479,17 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const off: usize = @intCast(try r.int(u64));
                 const piece = r.rest();
                 try r.end();
+                if (!imageRowsFit(row)) return error.BadFrame; // rank 0 refuses such a request before any frame
                 const total = row * m.cfg.hidden * 2;
                 if (off != img_rows.items.len or off + piece.len > total or piece.len == 0) return error.BadFrame;
                 try img_rows.appendSlice(gpa, piece);
                 if (img_rows.items.len == total) {
-                    m.setImages(spans.items, img_rows.items) catch |err| try refused(err);
+                    // rank 0 sets these rows after sending them; refusing here would split the ranks: the follower ends
+                    const set = if (testFault(.set_images)) error.InjectedFault else m.setImages(spans.items, img_rows.items);
+                    set catch |err| {
+                        std.log.err("lanes: rank 1 could not take the prompt's image rows ({s}); the follower ends", .{@errorName(err)});
+                        return err;
+                    };
                     img_rows.clearRetainingCapacity();
                 }
             },

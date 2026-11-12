@@ -18,6 +18,11 @@ serve_load() {
   local v
   # in this order: a path may name one expanded before it ($BUNDLE)
   for v in DEPLOY_DIR BUNDLE MODEL_DIR RANK_CACHE DS_KIT ENGRAM_DIR TOKEN_MAP RUN_ROOT; do eval "$v=\"${!v}\""; done
+  # images (MODALITIES=text_image): rank 0's tower weights (VISION_DIR, a sidecar with its SHA256SUMS) and both ranks'
+  # routing biases (DS_KIT/vision/gate_bias_vl.safetensors, pinned by VISION_BIAS_SHA256); TEST_FAULT: recovery tests
+  VISION_DIR=${VISION_DIR:-} VISION_BIAS_SHA256=${VISION_BIAS_SHA256:-} TEST_FAULT=${TEST_FAULT:-}
+  [ -n "$VISION_DIR" ] && eval "VISION_DIR=\"$VISION_DIR\""
+  case $MODALITIES in text|text_image) ;; *) die "MODALITIES must be text or text_image, not $MODALITIES";; esac
   BIN=$DEPLOY_DIR/native-hip/bin
   KIT=$DEPLOY_DIR/$KIT_SUBDIR
   [ "$PARALLEL" -ge 1 ] && [ "$PARALLEL" -le "$STREAMS" ] || die "PARALLEL $PARALLEL must be 1 .. STREAMS ($STREAMS)"
@@ -54,6 +59,17 @@ serve_check() {
     [ -e "$f" ] || die "rank $RANK: missing $f"
   done
   local sum
+  if [ "$MODALITIES" = text_image ]; then
+    local bias=$DS_KIT/vision/gate_bias_vl.safetensors
+    [ -f "$bias" ] || die "rank $RANK: MODALITIES=text_image needs $bias (tools/dsv41-zig/kit/make_bias_vl.py; deploy_rank0.sh --ds-kit copies it)"
+    [ -n "$VISION_BIAS_SHA256" ] || die "rank $RANK: MODALITIES=text_image needs VISION_BIAS_SHA256 (the routing biases' sha256)"
+    sum=$(sha256sum "$bias" | cut -d' ' -f1)
+    [ "$sum" = "$VISION_BIAS_SHA256" ] || die "rank $RANK: $bias is $sum, the config pins $VISION_BIAS_SHA256"
+    if [ "$RANK" = 0 ]; then
+      [ -n "$VISION_DIR" ] && [ -f "$VISION_DIR/SHA256SUMS" ] || die "rank 0: MODALITIES=text_image needs VISION_DIR, the tower's sidecar with its SHA256SUMS (tools/dsv41-zig/kit/make_vision_sidecar.py); now '$VISION_DIR'"
+      (cd "$VISION_DIR" && sha256sum --quiet -c SHA256SUMS) >&2 || die "rank 0: the vision sidecar $VISION_DIR does not match its SHA256SUMS"
+    fi
+  fi
   sum=$(sha256sum "$BUNDLE/inputs_manifest.json" | cut -d' ' -f1)
   [ "$sum" = "$BUNDLE_SHA256" ] || die "rank $RANK: inputs_manifest.json is $sum, the config pins $BUNDLE_SHA256"
   # U16: RANK_CACHE holds exactly the cache file the manifest names for this rank (the engine takes any
@@ -119,6 +135,8 @@ serve_env() {
   [ -n "${PREFILL_SPLIT_ZIP:-}" ] && SERVE_ENV+=(TF_DS_PREFILL_SPLIT_ZIP="$PREFILL_SPLIT_ZIP")
   [ -n "${LOGITS_SHA:-}" ] && SERVE_ENV+=(TF_DS_LOGITS_SHA="$LOGITS_SHA")
   [ -n "${WINDOW_LOGITS:-}" ] && SERVE_ENV+=(TF_DS_WINDOW_LOGITS="$WINDOW_LOGITS")
+  [ "$MODALITIES" = text_image ] && [ "$RANK" = 0 ] && SERVE_ENV+=(TF_DS_VISION_DIR="$VISION_DIR")
+  [ -n "$TEST_FAULT" ] && SERVE_ENV+=(TF_DS_TEST_FAULT="$TEST_FAULT")
   # the launch's identity in the peers' handshake (U46): the deployed commit, the bundle's and serve.conf's hashes
   local commit
   commit=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["commit"])' "$DEPLOY_DIR/DEPLOY.json")

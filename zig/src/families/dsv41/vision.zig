@@ -1,15 +1,19 @@
 //! Images on rank 0 for the served lane's vision path: an image's bytes into its picture on the request's thread
 //! (lanes.stream.Vision.prepare: decoded, planned, padded and cut into the ViT's patches as the lane's `decode` makes
-//! them, picture.zig), and the picture into its span's rows on the lane host's thread at the prompt pass (the tower's
-//! encode and span rows, vit.zig), which lanes.zig then hands to the text model and to the other ranks.
+//! them, picture.zig), and the picture into its span's rows (CUDA: on the lane host's thread at the prompt pass; HIP:
+//! on encoder.zig's thread), by vit.zig or vit_hip.zig, which lanes.zig then hands to the text model and to the ranks.
 const std = @import("std");
 const gpu = @import("gpu");
 const lanes = @import("lanes");
 const picture = @import("picture.zig");
-const vit = @import("vit.zig");
-const fmha = @import("fmha.zig");
+const hip = gpu.backend == .hip;
+/// The backend's tower: torch's kernels on CUDA (vit.zig), engineLab's declared arithmetic on HIP (vit_hip.zig).
+const vit = if (hip) @import("vit_hip.zig") else @import("vit.zig");
+const fmha = if (hip) struct {} else @import("fmha.zig");
+const hip_load = if (hip) @import("hip_load.zig") else struct {};
 const model = @import("model.zig");
 const pil = @import("pil.zig");
+const encoder = @import("encoder.zig");
 
 /// A prepared image's payload: its grid (six u32, little-endian: best_h, best_w, n_vit_h, n_vit_w, n_llm_h, n_llm_w)
 /// then its patches (bf16, picture.patchify's order), the patches 16-byte aligned.
@@ -23,13 +27,16 @@ pub const Vision = struct {
     m: *model.Model,
     cfg: picture.Config = .{},
     tower: vit.Tower,
+    kernels: if (hip) vit.Kernels else void = if (hip) undefined else {}, // HIP: the kit's vision.* kernels
     span: gpu.DeviceBuffer, // bf16 [max_span, 5120]: a picture's span rows
     scratch: gpu.DeviceBuffer, // the span's types and rows (Tower.spanRows)
     pil: ?*pil.Pil = null, // the formats picture.zig does not decode (null: no python3 with Pillow here)
+    own: ?gpu.Stream = null, // HIP: the tower's stream, apart from the model's (its encoder thread's)
 
-    /// The tower on `m`'s stream (its exact kernels and cuBLAS handle, as the tower gate ran them), its weights from
-    /// the checkpoint, torch's attention cubin from the kit's vision/, and its workspace for the largest picture.
+    /// The tower (CUDA: on `m`'s stream, its gate's kernels and cuBLAS handle, torch's cubin from the kit's vision/;
+    /// HIP: the kit's vision.* kernels), weights from `model_dir`'s index, its workspace for the largest picture.
     pub fn open(gpa: std.mem.Allocator, io: std.Io, m: *model.Model, model_dir: []const u8, kit_dir: []const u8) !*Vision {
+        if (hip) return openHip(gpa, io, m, model_dir);
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const cubin_path = try std.fmt.bufPrint(&path_buf, "{s}/vision/{s}", .{ kit_dir, fmha.cubin_file });
         const cubin = std.Io.Dir.cwd().readFileAlloc(io, cubin_path, gpa, .limited(64 << 20)) catch |err| return if (err == error.FileNotFound) error.NoVisionKit else err;
@@ -54,12 +61,54 @@ pub const Vision = struct {
         return v;
     }
 
+    fn openHip(gpa: std.mem.Allocator, io: std.Io, m: *model.Model, weights_dir: []const u8) !*Vision {
+        if (m.w.layers.len == 0 or m.w.layers[0].gate_b_vl == 0) return error.NoVisionKit; // (model.zig loads the bias)
+        const v = try gpa.create(Vision);
+        errdefer gpa.destroy(v);
+        v.* = .{ .gpa = gpa, .m = m, .tower = undefined, .span = undefined, .scratch = undefined };
+        v.kernels = (try hip_load.vision(m.kit)) orelse return error.NoVisionKernels;
+        const d = m.ctx.d;
+        v.own = try gpu.Stream.init(d, true);
+        errdefer v.own.?.deinit();
+        v.tower = try vit.Tower.open(gpa, io, d, v.own.?, weights_dir, &v.kernels);
+        errdefer v.tower.close();
+        const cells = vit.maxCells(v.cfg.max_tokens);
+        try v.tower.reserve(cells * v.cfg.ratio * v.cfg.ratio, cells);
+        v.span = try gpu.DeviceBuffer.alloc(d, v.cfg.max_tokens * vit.model_dim * 2);
+        errdefer v.span.free();
+        v.scratch = try gpu.DeviceBuffer.alloc(d, 256); // (unused on HIP)
+        errdefer v.scratch.free();
+        std.debug.print("{{\"vision\": \"HIP tower: {d} MiB on the device (weights and workspace for {d} patches)\"}}\n", .{ v.tower.bytes() >> 20, cells * v.cfg.ratio * v.cfg.ratio });
+        v.pil = pil.Pil.start(gpa, io) catch |err| blk: {
+            std.debug.print("{{\"vision\": \"no Pillow ({s}): images other than PNG are refused\"}}\n", .{@errorName(err)});
+            break :blk null;
+        };
+        if (v.pil) |p| std.debug.print("{{\"vision\": \"Pillow {s} decodes the formats other than PNG\"}}\n", .{p.versionText()});
+        return v;
+    }
+
     pub fn close(v: *Vision) void {
         if (v.pil) |p| p.stop(v.gpa);
         v.scratch.free();
         v.span.free();
         v.tower.close();
+        if (v.own) |*s| s.deinit();
         v.gpa.destroy(v);
+    }
+
+    /// HIP: the tower as its encoder thread drives it (the device made current there; `rows` on the tower's stream).
+    pub fn encoderTower(v: *Vision) encoder.Tower {
+        const T = struct {
+            fn bind(ctx: *anyopaque) anyerror!void {
+                const x: *Vision = @ptrCast(@alignCast(ctx));
+                try x.m.ctx.makeCurrent();
+            }
+            fn rows(ctx: *anyopaque, payload: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) anyerror!usize {
+                const x: *Vision = @ptrCast(@alignCast(ctx));
+                return x.rows(payload, gpa, out);
+            }
+        };
+        return .{ .ctx = v, .bind = T.bind, .rows = T.rows };
     }
 
     /// The server's view: the placeholder the template renders for each image and the picture it prepares.
@@ -117,15 +166,15 @@ pub const Vision = struct {
         }
     }
 
-    /// A prepared picture's span rows bf16 [tokens, 5120] appended to `out` (the tower on the model's stream, then the
-    /// rows to the host); its span's tokens.
+    /// A prepared picture's span rows bf16 [tokens, 5120] appended to `out` (the tower on its stream, then the rows to
+    /// the host); its span's tokens.
     pub fn rows(v: *Vision, payload: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !usize {
         if (payload.len < header_bytes) return error.BadImagePayload;
         var x: [6]usize = undefined;
         for (&x, 0..) |*f, i| f.* = std.mem.readInt(u32, payload[i * 4 ..][0..4], .little);
         const g: picture.Grid = .{ .best_h = x[0], .best_w = x[1], .n_vit_h = x[2], .n_vit_w = x[3], .n_llm_h = x[4], .n_llm_w = x[5] };
         const n = g.patches();
-        if (payload.len != header_bytes + n * vit.patch_in * 2 or g.spanTokens() > max_span) return error.BadImagePayload;
+        if (payload.len != header_bytes + n * vit.patch_in * 2 or g.spanTokens() > (if (hip) v.cfg.max_tokens else max_span)) return error.BadImagePayload;
         const body: []align(2) const u8 = @alignCast(payload[header_bytes..]);
         const patches = std.mem.bytesAsSlice(u16, body);
         const at = try v.tower.encode(g, patches, null);
@@ -136,7 +185,7 @@ pub const Vision = struct {
         const from = out.items.len;
         try out.resize(gpa, from + bytes);
         const d = v.m.ctx.d;
-        try d.check(d.api.cuMemcpyDtoH_v2(out.items[from..].ptr, v.span.ptr, bytes), "cuMemcpyDtoH");
+        if (hip) try gpu.copyD2H(d, out.items[from..], v.span.ptr) else try d.check(d.api.cuMemcpyDtoH_v2(out.items[from..].ptr, v.span.ptr, bytes), "cuMemcpyDtoH");
         return t;
     }
 };

@@ -80,8 +80,8 @@ pub const Config = struct {
     }
 };
 
-/// Kernel launches so far in this process (a profile's count by phase).
-pub var count: u64 = 0;
+/// Kernel launches so far on this thread (a profile's count by phase; the vision encoder's thread keeps its own).
+pub threadlocal var count: u64 = 0;
 
 /// A check run before every launch when set (the kit's strict mode: arguments against the kernel's metadata).
 pub var before: ?*const fn (f: Function, cfg: Config, args: *const Args) Error!void = null;

@@ -51,7 +51,8 @@ pub fn main(init: std.process.Init) !u8 {
     if (init.environ_map.get("TF_FAKE_VISION")) |v| if (std.mem.eql(u8, v, "1")) {
         const placeholder = "<\u{ff5c}deepseek_image\u{ff5c}>";
         engine.info_.vision = .{ .ctx = &engine, .placeholder = placeholder,
-            .token = text.tokenId(placeholder) orelse return error.NoImageToken, .prepare = imagePrepare };
+            .token = text.tokenId(placeholder) orelse return error.NoImageToken, .prepare = imagePrepare,
+            .max_tokens = if (init.environ_map.get("TF_FAKE_VISION_MAX")) |m| std.fmt.parseInt(u32, m, 10) catch 0 else 0 };
     };
     return server.serve.run(gpa, io, args, .{
         .engine = engine.engine(),

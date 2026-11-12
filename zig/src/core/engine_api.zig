@@ -274,6 +274,7 @@ pub const keepalive = @import("keepalive.zig");
 test {
     _ = @import("lane_host.zig");
     _ = @import("lane_host_reuse_test.zig");
+    _ = @import("lane_host_encode_test.zig");
     _ = @import("prompt_cache.zig");
     _ = @import("prompt_imprint.zig");
     _ = @import("keepalive.zig");

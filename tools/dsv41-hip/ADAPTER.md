@@ -33,7 +33,7 @@ Generated companions (regenerate with the two scripts; both read-only, both pinn
 | D10 | No PDL, clusters or cooperative launches on HIP: `gpu.caps.pdl = false`; the family derives `Tri.pdl` and the EXL3 `pdl` flag from caps; a `Config` with `pdl`/`cluster` set is refused on HIP. Plain stream order replaces programmatic serialization. | No AMD equivalent; stream order is strictly stronger, so correctness is preserved. |
 | D11 | Collectives move behind a family-level `Coll` interface (stream-ordered rank-ordered all-gather + `capturable` flag + abort). NCCL becomes the CUDA implementation; w-link supplies the host-staged TCP implementation and later a capturable device-proxy one (the rdma_gather stage/collect pattern over TCP). | 10 served collective call sites + NCCL bootstrap; graphs need to know whether a collective can live inside a capture. |
 | D12 | Graphs are off for first light. They are allowed only when the active `Coll` is capturable (device proxy); otherwise `TF_DS_GRAPHS=1` is refused at startup, with ashhart's `graph_split.Recorder` as the explicit fallback option. | Splitting at ~94 gathers per round would leave graph pieces of one layer each; the device-proxy design keeps a stretch whole. |
-| D13 | Text-only capability is an explicit `Modalities` option in the open/load contract (`native.Options`, `model.Options`, rank 1's flags), defaulting to `text` on HIP. With `text`, Vision.open (native.zig:148) and the routing-bias load (model.zig:330-333) never run; config.json and its hash are untouched; images are refused by the server's existing text-only path. | Handoff 6A. |
+| D13 | Text-only capability is an explicit `Modalities` option in the open/load contract (`native.Options`, `model.Options`, rank 1's flags), defaulting to `text` on HIP (`text_image` opens the HIP tower: section 8.1). With `text`, Vision.open (native.zig:148) and the routing-bias load (model.zig:330-333) never run; config.json and its hash are untouched; images are refused by the server's existing text-only path. | Handoff 6A. |
 | D14 | New build file `zig/build/hip_dsv41.zig`: step `native-hip` (x86_64 host + gfx1151 kit, no CUDA module in its graph), `dsv41-cpu` (CPU-only prep/check tools built from a GPU-free `dsv41_cpu` module root), host tests and GPU tests as separate steps. | Handoff 4, 6A, PLAN shared rules. |
 | D15 | The CUDA runtime `zig/src/cuda/*`, CUDA kernels and CUDA build file stay byte-identical. The family edits are mechanical; the CUDA facade keeps the family compiling host-only (no nvcc) as a cheap regression check, not a gate. | PLAN: CUDA build dropped as a gate, CUDA source kept for reference. Owner may drop the CUDA facade if it costs more than a day. |
 
@@ -369,6 +369,54 @@ lazily mid-request. Per-id launch counters are kept when `TF_GPU_STRICT=1` or `-
   succeeds, `strace -e openat` shows no read under `vision/`; (2) a chat request with an image part gets the refusal
   through the real HTTP path; (3) a text prompt containing the literal placeholder text renders as ordinary tokens (the
   #17 escape) and matches the encoder's token ids.
+
+### 8.1 Image input on HIP (`text_image`, local/hip-vision)
+
+Text stays the HIP default; `MODALITIES=text_image` (`TF_DS_MODALITIES` / rank 1 `--modalities`) opens the vision
+tower on rank 0. Everything above about `text` still holds: a text rank opens, loads and binds nothing of vision.
+
+- **Tower:** `vit_hip.zig` (vit.zig's `Tower` surface: open, reserve, encode with probes, spanRows) on the AMD kit's
+  `vision.*` kernels (`zig/kernels/hip/dsv41/vision.hip`: linear, rms_norm, attention, rope, add, silu_mul, gelu,
+  unfold, span), bound by `hip_load.vision` as an optional group. Only rank 0 of a text_image pair reads, loads or
+  requires the kit's vision object (`Kit.open`'s `vision` feature); a text rank and rank 1 skip it. vision.zig picks the backend's tower at compile time;
+  picture.zig, pil.zig, the payload and the server hook are shared with CUDA.
+- **Numerical identity:** engineLab's declared arithmetic (the HIP tower written by this port's author on
+  strix-halo-engine-lab's `pr/ds41-vision` 481141258, adapted, arithmetic unchanged; its exp and sqrt are hyukudan's
+  `declared_exp` / `declared_sqrt`, its erf fdlibm's `erff`: THIRD_PARTY_NOTICES.md), not torch's kernels: every linear one FP32 fma chain over k ascending per output (bf16 after the bias),
+  RMSNorm a wave-order sum with a correctly rounded root, attention a fused online softmax over 64-key tiles with a
+  declared exp, the 2D RoPE tables built on the host in double precision (libc pow / cos / sin), erf-GELU the fdlibm
+  approximations. Gate: `tf-dsv41-vision-check` (dsv41-hip-gpu-test) against the host reference's dumps
+  (`tools/dsv41-hip/vision-reference`: engineLab's `encode_reference`, its sources carried here; `make_golden.sh`
+  regenerates the golden of three synthetic pictures from a vision sidecar, `fetch_golden.sh` downloads the published
+  one, `SHA256SUMS` pins both): every step (RoPE tables, patch embed, all 32 blocks, final norm, aligner rows) and the
+  span byte for byte, and picture.zig's patches against the reference's prep. Fidelity (not
+  bitwise; CUDA's vit.zig bytes differ too), mean row cosine of the aligner rows on six pictures (2026-11-10): 0.9978 to
+  0.9997 against the release's FP32 torch tower, 0.9993 to 0.9998 against its BF16 CUDA run (the release's own BF16
+  run is 0.9977 to 0.9998 against FP32); the release's prep gave the same patches on all six.
+- **Assets:** rank 0 reads the 266 tower tensors (926 MiB BF16) from `TF_DS_VISION_DIR`, a one-shard sidecar made by
+  `tools/dsv41-zig/kit/make_vision_sidecar.py` from any checkpoint that holds them (the LibertAI EXL3 1017 checkpoint's
+  equal the release's: identity `32e3e2cc...`). Both ranks read the image routing biases from
+  `DS_KIT/vision/gate_bias_vl.safetensors` (`make_bias_vl.py`; required on both ranks: a rank without them would refuse
+  the spans its peer routes). Authenticate the source shards first (`verify_hf_cache.py`). serve_lib.sh checks both
+  (`VISION_DIR`'s SHA256SUMS, `VISION_BIAS_SHA256`) before a text_image start.
+- **Memory:** rank 0 holds the weights (926 MiB) and a workspace for the largest picture (1021 cells, 9189 patches:
+  324 MiB), a 10 MiB span buffer, and both ranks 4096 image rows (40 MiB) from the open, so an image request allocates
+  nothing on the device. Those rows are a request's cap: rank 0 refuses a request whose pictures' spans add up to more
+  (`TooManyImageRows`, before its encode), `setImages` never reallocates on HIP, and rank 1 rejects a `fill_images`
+  frame past the cap as a bad frame.
+- **Pair:** rank 0 runs the tower before `fill_begin` and sends the span rows (`fill_images`, 32 KiB pieces); rank 1
+  never runs it. A tower or decode error refuses the request before any frame; a rank-0 error between pieces leaves
+  rank 1's partial rows to the next `fill_begin`; rank 1 failing to take the complete rows ends the follower (the pair
+  restarts) instead of diverging; a sticky device fault (`DeviceFault`) is a broken pair. `TF_DS_TEST_FAULT`
+  (`tower`, `fill_images:K`, `set_images`; once a process) injects each for the recovery tests.
+- **Encoder thread:** rank 0's tower runs on a thread and HIP stream of its own (`encoder.zig`), never on the engine
+  thread. The lane host hands a request's pictures to it at submit (payloads copied) and admits that request only once
+  its rows are ready; queued requests without images go first meanwhile, in their order, and other streams keep
+  decoding. The prompt pass then takes the ready rows (it never runs the tower). A cancelled request's job is dropped
+  (one being encoded is freed when its picture is done); a failed encode is that request's error at its prompt pass.
+- **Behaviour:** an image prompt skips the RAM prompt cache and the reuse hook (its tokens are
+  placeholders); a 1920x1080 picture encodes in about 2.9 s on gfx1151 (measured with the tower on the engine thread).
+  PNG decodes in Zig; other formats need Python 3 with Pillow (the runtime image's `rocm10.0-vision` tag).
 
 ## 9. Build
 

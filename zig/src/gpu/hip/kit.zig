@@ -23,7 +23,8 @@ pub const abi_version: u32 = abi_h.TF_DS_HIP_ABI_VERSION;
 
 pub const SpecItem = manifest.SpecItem;
 
-pub const Features = struct { drafts: bool = false, engram: bool = false, profile: bool = false, graphs: bool = false };
+/// `vision` false: the objects that hold only the vision tower's kernels (vision.*) are not read, loaded or required.
+pub const Features = struct { drafts: bool = false, engram: bool = false, profile: bool = false, graphs: bool = false, vision: bool = true };
 
 pub const Entry = struct {
     k: manifest.Kernel,
@@ -71,11 +72,15 @@ pub const Kit = struct {
             std.log.err("kit {s} is built for {s} (wave {d}); this device is {s}", .{ dir, k.m.arch, k.m.wave, arch });
             return error.ArchMismatch;
         }
-        k.modules = try a.alloc(Module, k.m.objects.len);
+        const keep = try a.alloc(bool, k.m.objects.len);
+        for (k.m.objects, keep) |o, *x| x.* = features.vision or !visionOnly(k.m, o.file);
+        k.modules = try a.alloc(Module, std.mem.count(bool, keep, &.{true}));
+        const slot = try a.alloc(usize, k.m.objects.len); // an object's module
         var loaded: usize = 0;
         errdefer for (k.modules[0..loaded]) |*mod| mod.unload();
         const metas = try a.alloc(hsaco.CodeObject, k.m.objects.len);
         for (k.m.objects, 0..) |o, i| {
+            if (!keep[i]) continue;
             const bytes = try std.Io.Dir.cwd().readFileAllocOptions(io, try std.fs.path.join(a, &.{ dir, o.file }), gpa, .limited(1 << 30), .@"16", null);
             defer gpa.free(bytes);
             const sum = manifest.sha256Hex(bytes);
@@ -85,19 +90,19 @@ pub const Kit = struct {
             }
             try checkImage(bytes, arch);
             metas[i] = try ownCodeObject(a, try hsaco.parse(a, bytes));
-            k.modules[i] = try Module.load(d, bytes);
+            k.modules[loaded] = try Module.load(d, bytes);
+            slot[i] = loaded;
             loaded += 1;
         }
-        k.entries = try a.alloc(Entry, k.m.kernels.len);
-        k.counts = try a.alloc(std.atomic.Value(u64), k.m.kernels.len);
-        for (k.counts) |*c| c.* = .init(0);
-        for (k.m.kernels, k.entries, 0..) |mk, *e, i| {
+        var entries: std.ArrayList(Entry) = .empty;
+        for (k.m.kernels) |mk| {
             const oi = for (k.m.objects, 0..) |o, j| {
                 if (std.mem.eql(u8, o.file, mk.object)) break j;
             } else {
                 std.log.err("kit {s}: kernel {s} names object {s}, which the manifest does not list", .{ dir, mk.id, mk.object });
                 return error.KitManifest;
             };
+            if (!keep[oi]) continue;
             const meta = metas[oi].find(mk.symbol) orelse {
                 std.log.err("kit {s}: {s} ({s}) is not in {s}", .{ dir, mk.symbol, mk.id, mk.object });
                 return error.MissingKernel;
@@ -108,10 +113,13 @@ pub const Kit = struct {
                 return error.KernelRefused;
             }
             var name_z: [256]u8 = undefined;
-            const f = try k.modules[oi].function(try std.fmt.bufPrintSentinel(&name_z, "{s}", .{mk.symbol}, 0));
-            e.* = .{ .k = mk, .f = f, .explicit = meta.explicit(), .max_threads = meta.max_flat_workgroup_size };
-            try k.by_handle.put(gpa, @intFromPtr(f.handle), @intCast(i));
+            const f = try k.modules[slot[oi]].function(try std.fmt.bufPrintSentinel(&name_z, "{s}", .{mk.symbol}, 0));
+            try k.by_handle.put(gpa, @intFromPtr(f.handle), @intCast(entries.items.len));
+            try entries.append(a, .{ .k = mk, .f = f, .explicit = meta.explicit(), .max_threads = meta.max_flat_workgroup_size });
         }
+        k.entries = entries.items;
+        k.counts = try a.alloc(std.atomic.Value(u64), k.entries.len);
+        for (k.counts) |*c| c.* = .init(0);
         try k.requireAll(dir, features);
         if (k.strict) {
             active = k;
@@ -135,7 +143,7 @@ pub const Kit = struct {
         var missing: usize = 0;
         const lists = [_]struct { bool, []const []const u8 }{ .{ true, k.m.required.always }, .{ f.drafts, k.m.required.drafts }, .{ f.engram, k.m.required.engram }, .{ f.profile, k.m.required.profile }, .{ f.graphs, k.m.required.graphs } };
         for (lists) |l| if (l[0]) for (l[1]) |id| {
-            if (k.anyOf(id)) continue;
+            if (k.anyOf(id) or (!f.vision and isVision(id))) continue;
             std.log.err("kit {s}: required kernel {s} is missing", .{ dir, id });
             missing += 1;
         };
@@ -169,6 +177,32 @@ pub const Kit = struct {
         return k.counts[i].load(.monotonic);
     }
 };
+
+fn isVision(id: []const u8) bool {
+    return std.mem.startsWith(u8, id, "vision.");
+}
+
+/// Whether every kernel of `file` is the vision tower's (a text configuration then skips the object).
+fn visionOnly(m: manifest.Manifest, file: []const u8) bool {
+    var any = false;
+    for (m.kernels) |mk| if (std.mem.eql(u8, mk.object, file)) {
+        if (!isVision(mk.id)) return false;
+        any = true;
+    };
+    return any;
+}
+
+test "a text configuration skips only the objects that hold nothing but vision kernels" {
+    const kern = struct {
+        fn of(id: []const u8, object: []const u8) manifest.Kernel {
+            return .{ .id = id, .symbol = id, .object = object, .args = &.{}, .kernarg_size = 0, .wave = 32, .max_flat_workgroup_size = 256, .lds_static = 0, .scratch = 0, .vgpr = 0, .sgpr = 0 };
+        }
+    };
+    const m: manifest.Manifest = .{ .schema = manifest.schema, .kit = "t", .abi_version = 1, .arch = "gfx1151", .wave = 32, .objects = &.{}, .kernels = &.{ kern.of("vision.linear", "v.hsaco"), kern.of("vision.span", "v.hsaco"), kern.of("vision.add", "mixed.hsaco"), kern.of("glue.x", "mixed.hsaco"), kern.of("glue.y", "g.hsaco") } };
+    try std.testing.expect(visionOnly(m, "v.hsaco"));
+    try std.testing.expect(!visionOnly(m, "mixed.hsaco") and !visionOnly(m, "g.hsaco") and !visionOnly(m, "none.hsaco"));
+    try std.testing.expect(isVision("vision.rope") and !isVision("glue.vision"));
+}
 
 fn strictFromEnv() bool {
     const v = std.c.getenv("TF_GPU_STRICT") orelse return true;

@@ -44,7 +44,7 @@ class ImageRoutes(unittest.TestCase):
         log_path = Path(cls.temp.name) / 'server.log'
         cls.log = log_path.open('w')
         cls.addClassCleanup(cls.log.close)
-        env = dict(os.environ, TF_FAKE_VISION='1', TF_FAKE_TOKENIZER=os.environ['TF_VISION_TEST_TOKENIZER'])
+        env = dict(os.environ, TF_FAKE_VISION='1', TF_FAKE_VISION_MAX='16', TF_FAKE_TOKENIZER=os.environ['TF_VISION_TEST_TOKENIZER'])
         server = os.environ.get('TF_VISION_TEST_SERVER', str(SRC / 'zig-out/server/fake_serve'))
         cls.process = subprocess.Popen([server, 'serve', str(SRC / 'zig/tests/server/fixtures'), '--host', '127.0.0.1',
                                         '--port', '0', '--name', 'dsv41'], env=env, stdout=cls.log, stderr=subprocess.STDOUT)
@@ -190,6 +190,16 @@ class ImageRoutes(unittest.TestCase):
             self.assertEqual(spans(tokens['tokens']), [4, 8])  # the template puts the results in the calls' order
             seen.append(tokens['tokens'])
         self.assertEqual(seen[0], seen[1])
+
+    def test_images_over_the_engine_cap_are_refused_with_400(self):
+        body = self.chat(0)
+        body['messages'][0]['content'] = [{'type': 'text', 'text': 'Compare.'}] + [image_url('image-B')] * 2
+        status, answer = self.post('/v1/chat/completions', body)
+        self.assertEqual(status, 200, answer)  # 16 image tokens: at the cap
+        body['messages'][0]['content'].append(image_url('image-B'))
+        status, answer = self.post('/v1/chat/completions', body)
+        self.assertEqual(status, 400, answer)  # 24: over it
+        self.assertIn('image tokens', answer['error']['message'])
 
 if __name__ == '__main__':
     unittest.main()

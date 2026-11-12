@@ -38,7 +38,8 @@ const draft_mod = @import("draft.zig");
 const link = @import("link.zig");
 const rank_cache = @import("rank_cache.zig");
 const sampling = @import("sampling.zig");
-/// The vision tower exists in CUDA builds only (gpu.features.vision); a HIP build compiles none of it.
+const encoder_mod = @import("encoder.zig");
+/// The vision tower (gpu.features.vision): CUDA's and HIP's behind vision.zig.
 const vision_mod = if (gpu.features.vision) @import("vision.zig") else struct {
     pub const Vision = lanes_mod.VisionTower;
 };
@@ -106,6 +107,7 @@ const State = struct {
     m: *model.Model,
     lanes: lanes_mod.Lanes,
     vision: ?*vision_mod.Vision = null,
+    encoder: ?*encoder_mod.Encoder = null, // HIP: the tower's own thread
     vocab: ?*lanes.grammar.Vocab = null,
 };
 
@@ -191,22 +193,48 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
     };
     errdefer if (st.vocab) |v| v.deinit(gpa);
     st.lanes.vocab = st.vocab;
-    // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias),
-    // unless this rank serves text only: config.json still declares the tower, nothing of it is opened, and the server
-    // refuses image parts (Loaded.vision null)
+    // a vision checkpoint's tower on this rank (CUDA: the kit's vision/; HIP: TF_DS_VISION_DIR, a sidecar made by
+    // make_vision_sidecar.py, else the model's index), unless this rank serves text only: config.json still declares
+    // the tower, nothing of it is opened, and the server refuses image parts (Loaded.vision null)
     st.vision = null;
     if (st.m.cfg.vision and mods == .text) std.log.info("config.json declares a vision tower; not opened (text capability)", .{});
-    if (gpu.features.vision and st.m.cfg.vision and mods == .text_image) st.vision = try vision_mod.Vision.open(gpa, io, st.m, dir, getenv("TF_DS_KIT").?);
+    if (gpu.features.vision and st.m.cfg.vision and mods == .text_image) {
+        const weights_dir = if (gpu.backend == .hip) (getenv("TF_DS_VISION_DIR") orelse dir) else dir;
+        st.vision = try vision_mod.Vision.open(gpa, io, st.m, weights_dir, getenv("TF_DS_KIT").?);
+    }
     errdefer if (gpu.features.vision) if (st.vision) |v| v.close();
     st.lanes.vision = st.vision;
+    st.encoder = null;
+    if (gpu.features.vision and gpu.backend == .hip) if (st.vision) |v| {
+        const enc = try gpa.create(encoder_mod.Encoder);
+        enc.* = .init(gpa, io, v.encoderTower(), model.Model.image_rows_reserved);
+        enc.start() catch |err| {
+            gpa.destroy(enc);
+            return err;
+        };
+        st.encoder = enc;
+    };
+    errdefer if (st.encoder) |enc| stopEncoder(gpa, enc);
+    st.lanes.encoder = st.encoder;
+    var hook: ?lanes.stream.Vision = if (gpu.features.vision) (if (st.vision) |v| v.hook() else null) else null;
+    if (hook) |*x| x.max_tokens = if (model.Model.image_rows_cap) |cap| @intCast(cap) else 0;
+    if (hook) |*x| if (st.encoder) |enc| {
+        x.encode = enc.hook();
+    };
     // the pool is the model's (preallocated): a stream takes no device memory of its own
     const L = lanes_mod.Lanes;
     const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn };
-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (gpu.features.vision) (if (st.vision) |v| v.hook() else null) else null, .structures = st.vocab != null, .context_window = lanes_mod.usableContext(st.m.pool_cap, st.m.eng.round_rows) };
+    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = hook, .structures = st.vocab != null, .context_window = lanes_mod.usableContext(st.m.pool_cap, st.m.eng.round_rows) };
+}
+
+fn stopEncoder(gpa: std.mem.Allocator, enc: *encoder_mod.Encoder) void {
+    enc.stop();
+    gpa.destroy(enc);
 }
 
 fn deinitFn(ptr: *anyopaque) void {
     const st: *State = @ptrCast(@alignCast(ptr));
+    if (st.encoder) |enc| stopEncoder(st.gpa, enc); // before the tower it drives
     st.lanes.deinit(); // rank 1 hears done
     if (st.vocab) |v| v.deinit(st.gpa);
     if (gpu.features.vision) if (st.vision) |v| v.close();
@@ -232,7 +260,11 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
-        error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
+        error.NoVisionKit => if (gpu.backend == .hip) "text_image needs the image routing biases: TF_DS_KIT's vision/gate_bias_vl.safetensors (tools/dsv41-zig/kit/make_bias_vl.py)" else "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
+        error.NoVisionKernels => "text_image on HIP needs the AMD kit's vision.* kernels (vision.hip): a kit built before them",
+        error.NoVisionWeights => "text_image on HIP needs the vision tower's weights: TF_DS_VISION_DIR (a sidecar made by tools/dsv41-zig/kit/make_vision_sidecar.py) with model.safetensors.index.json",
+        error.MissingVisionTensor, error.BadVisionTensor => "the vision weights (TF_DS_VISION_DIR) lack a tower tensor or hold one of another dtype or shape",
+        error.TooManyImageRows => std.fmt.comptimePrint("a request's images take at most {d} image tokens on this engine (four pictures at the largest size): send fewer or smaller images", .{model.Model.image_rows_reserved}),
         error.VisionUnsupported => "image input is not implemented on this backend: serve text only (TF_DS_MODALITIES=text)",
         error.BadModalities => "TF_DS_MODALITIES: text or text_image",
         error.NoCollective => "this build has no collectives transport for the ranks yet (HIP: w-link's TCP transport, model.Options.open_coll)",

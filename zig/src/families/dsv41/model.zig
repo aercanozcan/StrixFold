@@ -37,8 +37,8 @@ const rdma = @import("rdma.zig");
 /// What a served request may carry (ADAPTER.md D13): text, or text with images when the vision tower is opened. The
 /// checkpoint's config.json is never changed: a text model keeps its vision_config and simply never opens the tower.
 pub const Modalities = enum { text, text_image };
-/// CUDA keeps serving images when the checkpoint has a tower; the HIP build has no vision path, so text.
-pub const default_modalities: Modalities = if (gpu.features.vision) .text_image else .text;
+/// CUDA keeps serving images when the checkpoint has a tower; HIP serves text unless asked (TF_DS_MODALITIES).
+pub const default_modalities: Modalities = if (gpu.backend == .cuda and gpu.features.vision) .text_image else .text;
 
 /// CUDA-only state (gpu.features): NCCL behind the collectives, the four-node split, its RDMA rings. Empty on HIP.
 const Nccl = if (gpu.backend == .cuda) comm_mod.Comm else void;
@@ -280,7 +280,7 @@ pub const Model = struct {
         // there for the peers' handshake
         if (gpu.backend == .hip) {
             const caps = try ctx.caps();
-            m.kit = try gpu.Kit.open(gpa, io, d, o.hip_kit orelse try std.fs.path.join(a, &.{ o.kit_dir, "hip" }), caps.archName(), .{ .drafts = o.drafts, .engram = c.engram_layers.slice().len > 0, .graphs = o.graphs });
+            m.kit = try gpu.Kit.open(gpa, io, d, o.hip_kit orelse try std.fs.path.join(a, &.{ o.kit_dir, "hip" }), caps.archName(), .{ .drafts = o.drafts, .engram = c.engram_layers.slice().len > 0, .graphs = o.graphs, .vision = o.modalities == .text_image and o.rank == 0 });
             m.aux_which = try tri_aux.Which.fromEnv();
         }
         errdefer if (gpu.backend == .hip) m.kit.deinit();
@@ -474,7 +474,10 @@ pub const Model = struct {
         // a vision checkpoint's image routing bias (without it a prompt with images is refused; text runs as ever)
         if (gpu.features.vision and c.vision and o.modalities == .text_image) {
             const path = o.vision_bias orelse try std.fs.path.join(a, &.{ o.kit_dir, "vision", "gate_bias_vl.safetensors" });
-            m.loadVisionBias(path) catch |err| if (o.vision_bias != null or err != error.FileNotFound) return err;
+            // HIP: both ranks need it (a rank without it would refuse the spans its peer routes): none starts without
+            m.loadVisionBias(path) catch |err| if (gpu.backend == .hip or o.vision_bias != null or err != error.FileNotFound) return if (err == error.FileNotFound) error.NoVisionKit else err;
+            // HIP: a request's image rows at most, from the start: an image prompt allocates nothing on either rank
+            if (gpu.backend == .hip) m.img_buf = try gpu.DeviceBuffer.alloc(m.ctx.d, image_rows_reserved * c.hidden * 2);
         }
 
         // fillSplit's Engram rows exchange: the peer's projection of this rank's columns (both ranks alike)
@@ -730,11 +733,17 @@ pub const Model = struct {
         }
     }
 
+    /// The image rows a text_image rank keeps on the device from its open (four pictures of a whole span).
+    pub const image_rows_reserved = 4096;
+    /// A request's image rows at most (HIP: what its open reserved; CUDA grows its buffer instead).
+    pub const image_rows_cap: ?usize = if (gpu.backend == .hip) image_rows_reserved else null;
+
     /// The filling prompt's image spans (absolute positions, in order) and their rows bf16 [tokens, hidden] from the
     /// host, after fillBegin and before its chunks.
     pub fn setImages(m: *Model, spans: []const prompt.Span, rows: []const u8) !void {
         if (rows.len > 0) {
             if (m.img_buf == null or m.img_buf.?.len < rows.len) {
+                if (image_rows_cap != null) return error.TooManyImageRows; // HIP never reallocates (both ranks alike)
                 if (m.img_buf) |*b| b.free();
                 m.img_buf = null;
                 m.img_buf = try gpu.DeviceBuffer.alloc(m.ctx.d, rows.len);
